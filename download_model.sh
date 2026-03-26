@@ -3,7 +3,7 @@
 #
 # Usage: ./download_model.sh [target-dir]
 #
-# Requires: huggingface-cli (pip install huggingface_hub)
+# Requires: hf CLI (pip install huggingface_hub[cli])
 
 set -e
 
@@ -16,9 +16,16 @@ echo ""
 
 mkdir -p "$TARGET_DIR"
 
-# Check if huggingface-cli is available
-if command -v huggingface-cli &> /dev/null; then
-    huggingface-cli download "$REPO_ID" \
+# Check if hf CLI is available (huggingface-cli in older versions)
+HF_CLI=""
+if command -v hf &> /dev/null; then
+    HF_CLI="hf"
+elif command -v huggingface-cli &> /dev/null; then
+    HF_CLI="huggingface-cli"
+fi
+
+if [ -n "$HF_CLI" ]; then
+    $HF_CLI download "$REPO_ID" \
         --local-dir "$TARGET_DIR" \
         --include "consolidated.safetensors" "params.json" "tekken.json" "voice_embedding/*"
 elif command -v wget &> /dev/null; then
@@ -42,8 +49,8 @@ elif command -v wget &> /dev/null; then
         wget -c "$BASE_URL/voice_embedding/$voice.pt" -O "$TARGET_DIR/voice_embedding/$voice.pt"
     done
 else
-    echo "Error: Need huggingface-cli or wget"
-    echo "Install: pip install huggingface_hub"
+    echo "Error: Need hf CLI or wget"
+    echo "Install: pip install huggingface_hub[cli]"
     exit 1
 fi
 

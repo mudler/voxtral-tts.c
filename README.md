@@ -46,7 +46,7 @@ make noblas
 ### Download Model
 
 ```bash
-# Requires huggingface-cli or wget
+# Requires hf CLI (pip install huggingface_hub[cli]) or wget
 ./download_model.sh voxtral-tts-model
 ```
 
