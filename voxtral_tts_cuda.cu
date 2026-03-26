@@ -310,7 +310,55 @@ extern "C" int tts_cuda_upload_acoustic_weights(void *acoustic_ptr) {
 }
 
 /* ========================================================================
+ * BF16 to F32 conversion kernel (on GPU)
+ * ======================================================================== */
+
+static float *get_gpu_weight_f32(const void *d_W_bf16, size_t n_elements);
+
+/* Helper: y[M,N] = x[M,K] @ W_bf16[N,K]^T  (all on GPU)
+ * Converts bf16 weights to f32 scratch, then calls cublasSgemm. */
+static void gpu_linear_bf16(float *d_y, const float *d_x, const void *d_W_bf16,
+                             int M, int K, int N) {
+    float *d_W_f32 = get_gpu_weight_f32(d_W_bf16, (size_t)N * K);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm((cublasHandle_t)g_cuda.cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        d_W_f32, K, d_x, K, &beta, d_y, N);
+}
+
+
+__global__ void bf16_to_f32_kernel(float *dst, const __nv_bfloat16 *src, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __bfloat162float(src[i]);
+    }
+}
+
+/* Scratch buffer for bf16->f32 weight conversion on GPU */
+static float *d_weight_scratch = NULL;
+static size_t d_weight_scratch_cap = 0;
+
+static float *get_gpu_weight_f32(const void *d_W_bf16, size_t n_elements) {
+    if (n_elements > d_weight_scratch_cap) {
+        if (d_weight_scratch) cudaFree(d_weight_scratch);
+        cudaMalloc(&d_weight_scratch, n_elements * sizeof(float));
+        d_weight_scratch_cap = d_weight_scratch ? n_elements : 0;
+    }
+    if (!d_weight_scratch) return NULL;
+
+    int threads = 256;
+    int blocks = ((int)n_elements + threads - 1) / threads;
+    bf16_to_f32_kernel<<<blocks, threads>>>(
+        d_weight_scratch, (const __nv_bfloat16 *)d_W_bf16, (int)n_elements);
+    return d_weight_scratch;
+}
+
+/* ========================================================================
  * cuBLAS Linear (bf16 weights x f32 activations -> f32)
+ *
+ * Strategy: convert bf16 weights to f32 on GPU, then use standard sgemm.
+ * The conversion is cached in a scratch buffer to avoid repeated allocation.
  * ======================================================================== */
 
 extern "C" void tts_cuda_linear_bf16(float *y, const float *x,
@@ -319,19 +367,21 @@ extern "C" void tts_cuda_linear_bf16(float *y, const float *x,
                                       const void *W_gpu) {
     cublasHandle_t handle = (cublasHandle_t)g_cuda.cublas_handle;
 
-    /* Upload x to GPU if needed (check if it's a device pointer) */
+    /* Detect if x is on device or host */
     float *d_x_local = NULL;
+    int free_x = 0;
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, x);
     if (err != cudaSuccess || attr.type != cudaMemoryTypeDevice) {
         cudaMalloc(&d_x_local, (size_t)seq_len * in_dim * sizeof(float));
         cudaMemcpy(d_x_local, x, (size_t)seq_len * in_dim * sizeof(float),
                    cudaMemcpyHostToDevice);
+        free_x = 1;
     } else {
         d_x_local = (float *)x;
     }
 
-    /* Upload W if no GPU version provided */
+    /* Get bf16 weights on GPU, upload if needed */
     void *d_W = (void *)W_gpu;
     int free_W = 0;
     if (!d_W) {
@@ -339,61 +389,45 @@ extern "C" void tts_cuda_linear_bf16(float *y, const float *x,
         free_W = 1;
     }
 
-    /* Allocate output on GPU */
+    /* Convert bf16 weights to f32 on GPU */
+    size_t n_weights = (size_t)out_dim * in_dim;
+    float *d_W_f32 = get_gpu_weight_f32(d_W, n_weights);
+
+    /* Detect if y is on device or host */
     float *d_y = NULL;
-    cudaPointerGetAttributes(&attr, y);
-    int y_on_device = (attr.type == cudaMemoryTypeDevice);
+    int free_y = 0;
+    err = cudaPointerGetAttributes(&attr, y);
+    int y_on_device = (err == cudaSuccess && attr.type == cudaMemoryTypeDevice);
     if (!y_on_device) {
         cudaMalloc(&d_y, (size_t)seq_len * out_dim * sizeof(float));
+        free_y = 1;
     } else {
         d_y = y;
     }
 
-    /* cuBLAS GEMM: y = x @ W^T
-     * cuBLAS is column-major, so we compute: y^T = W @ x^T
-     * which in row-major terms is: y[M,N] = x[M,K] @ W[N,K]^T
-     * cuBLAS call: C = alpha * op(A) * op(B) + beta * C
-     *   op(A) = W^T (transposed), op(B) = x (not transposed)
-     *   M_cublas = out_dim, N_cublas = seq_len, K_cublas = in_dim
+    /* cuBLAS sgemm: y = x @ W^T (all f32 now)
+     * Column-major: C[out_dim, seq_len] = W_f32^T[out_dim, in_dim] @ x[in_dim, seq_len]
      */
     float alpha = 1.0f, beta = 0.0f;
-
-    if (g_cuda.has_bf16) {
-        /* Native bf16 GEMM on Ampere+ */
-        CUBLAS_CHECK(cublasGemmEx(handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            out_dim, seq_len, in_dim,
-            &alpha,
-            d_W, CUDA_R_16BF, in_dim,
-            d_x_local, CUDA_R_32F, in_dim,
-            &beta,
-            d_y, CUDA_R_32F, out_dim,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    } else {
-        /* Fallback: convert bf16->fp16 then GEMM */
-        /* For simplicity, use f32 compute with bf16 upcast */
-        CUBLAS_CHECK(cublasGemmEx(handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            out_dim, seq_len, in_dim,
-            &alpha,
-            d_W, CUDA_R_16BF, in_dim,
-            d_x_local, CUDA_R_32F, in_dim,
-            &beta,
-            d_y, CUDA_R_32F, out_dim,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT));
-    }
+    CUBLAS_CHECK(cublasSgemm(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        out_dim, seq_len, in_dim,
+        &alpha,
+        d_W_f32, in_dim,
+        d_x_local, in_dim,
+        &beta,
+        d_y, out_dim));
 
     /* Copy output back if needed */
-    if (!y_on_device) {
+    if (free_y) {
         cudaMemcpy(y, d_y, (size_t)seq_len * out_dim * sizeof(float),
                    cudaMemcpyDeviceToHost);
         cudaFree(d_y);
     }
 
-    if (d_x_local != x && d_x_local != NULL) cudaFree(d_x_local);
+    if (free_x) cudaFree(d_x_local);
     if (free_W) cudaFree(d_W);
+    /* Note: d_W_f32 is a cached scratch buffer, not freed here */
 }
 
 /* ========================================================================
@@ -629,15 +663,24 @@ extern "C" void tts_cuda_causal_attention_decode(
 extern "C" void tts_cuda_bidirectional_attention(
     float *d_out, const float *d_Q, const float *d_K, const float *d_V,
     int seq_len, int n_heads, int n_kv_heads, int head_dim, float scale) {
-    /* For 3 tokens, the attention matrix is tiny (3x3).
-     * Just use the causal kernel without masking — all positions attend to all. */
+    /*
+     * For seq_len=3 (acoustic transformer): process each query position
+     * by calling the decode kernel once per position.
+     * Q/K/V layout: [seq_len, n_heads * head_dim] or [seq_len, n_kv_heads * head_dim]
+     */
     int heads_per_kv = n_heads / n_kv_heads;
-    int threads = 32; /* 3 tokens, minimal parallelism */
+    int q_stride = n_heads * head_dim;
+    int threads = 32;
     size_t smem = seq_len * sizeof(float);
 
-    causal_attention_decode_kernel<<<n_heads, threads, smem>>>(
-        d_out, d_Q, d_K, d_V,
-        seq_len, n_kv_heads, head_dim, scale, heads_per_kv, 0);
+    for (int i = 0; i < seq_len; i++) {
+        causal_attention_decode_kernel<<<n_heads, threads, smem>>>(
+            d_out + i * q_stride,
+            d_Q + i * q_stride,
+            d_K, d_V,
+            seq_len, /* attend to all positions (bidirectional) */
+            n_kv_heads, head_dim, scale, heads_per_kv, 0);
+    }
 }
 
 /* ========================================================================
@@ -687,28 +730,13 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
         cublasHandle_t handle = (cublasHandle_t)g_cuda.cublas_handle;
 
         /* Q = x_norm @ Wq^T */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            q_dim, 1, dim, &alpha,
-            l->wq, CUDA_R_16BF, dim,
-            g_cuda.d_x_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_q, CUDA_R_32F, q_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_q, g_cuda.d_x_norm, l->wq, 1, dim, q_dim);
 
         /* K = x_norm @ Wk^T */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            kv_dim, 1, dim, &alpha,
-            l->wk, CUDA_R_16BF, dim,
-            g_cuda.d_x_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_k, CUDA_R_32F, kv_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_k, g_cuda.d_x_norm, l->wk, 1, dim, kv_dim);
 
         /* V = x_norm @ Wv^T */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            kv_dim, 1, dim, &alpha,
-            l->wv, CUDA_R_16BF, dim,
-            g_cuda.d_x_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_v, CUDA_R_32F, kv_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_v, g_cuda.d_x_norm, l->wv, 1, dim, kv_dim);
 
         /* Apply RoPE to Q and K */
         rope_kernel<<<TTS_DEC_HEADS, TTS_DEC_HEAD_DIM / 2>>>(
@@ -735,12 +763,7 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
             scale, kv_dim);
 
         /* WO projection */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim, 1, q_dim, &alpha,
-            l->wo, CUDA_R_16BF, q_dim,
-            g_cuda.d_attn_out, CUDA_R_32F, q_dim,
-            &beta, g_cuda.d_proj_out, CUDA_R_32F, dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_proj_out, g_cuda.d_attn_out, l->wo, 1, q_dim, dim);
 
         /* Residual: x += proj_out */
         tts_cuda_add_inplace(g_cuda.d_x, g_cuda.d_proj_out, dim);
@@ -750,30 +773,15 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
                           1, dim, TTS_DEC_NORM_EPS);
 
         /* w1 (gate) and w3 (up) */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            TTS_DEC_HIDDEN, 1, dim, &alpha,
-            l->w1, CUDA_R_16BF, dim,
-            g_cuda.d_x_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_gate, CUDA_R_32F, TTS_DEC_HIDDEN,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_gate, g_cuda.d_x_norm, l->w1, 1, dim, TTS_DEC_HIDDEN);
 
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            TTS_DEC_HIDDEN, 1, dim, &alpha,
-            l->w3, CUDA_R_16BF, dim,
-            g_cuda.d_x_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_up, CUDA_R_32F, TTS_DEC_HIDDEN,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_up, g_cuda.d_x_norm, l->w3, 1, dim, TTS_DEC_HIDDEN);
 
         /* Fused SiLU(gate) * up */
         tts_cuda_silu_mul(g_cuda.d_gate, g_cuda.d_up, TTS_DEC_HIDDEN);
 
         /* w2 (down) */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim, 1, TTS_DEC_HIDDEN, &alpha,
-            l->w2, CUDA_R_16BF, TTS_DEC_HIDDEN,
-            g_cuda.d_gate, CUDA_R_32F, TTS_DEC_HIDDEN,
-            &beta, g_cuda.d_ffn_out, CUDA_R_32F, dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_ffn_out, g_cuda.d_gate, l->w2, 1, TTS_DEC_HIDDEN, dim);
 
         /* Residual: x += ffn_out */
         tts_cuda_add_inplace(g_cuda.d_x, g_cuda.d_ffn_out, dim);
@@ -832,23 +840,11 @@ extern "C" void tts_cuda_llm_prefill(const float *embeds, int seq_len, int start
         tts_cuda_rms_norm(d_x_norm, d_x, l->attention_norm, seq_len, dim, TTS_DEC_NORM_EPS);
 
         /* Q, K, V projections (batched) */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            q_dim, seq_len, dim, &alpha,
-            l->wq, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
-            &beta, d_q, CUDA_R_32F, q_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_q, d_x_norm, l->wq, seq_len, dim, q_dim);
 
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            kv_dim, seq_len, dim, &alpha,
-            l->wk, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
-            &beta, d_k, CUDA_R_32F, kv_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_k, d_x_norm, l->wk, seq_len, dim, kv_dim);
 
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            kv_dim, seq_len, dim, &alpha,
-            l->wv, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
-            &beta, d_v, CUDA_R_32F, kv_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_v, d_x_norm, l->wv, seq_len, dim, kv_dim);
 
         /* Apply RoPE to all positions */
         for (int s = 0; s < seq_len; s++) {
@@ -872,35 +868,19 @@ extern "C" void tts_cuda_llm_prefill(const float *embeds, int seq_len, int start
             seq_len, start_pos, TTS_DEC_HEADS, TTS_DEC_KV_HEADS, TTS_DEC_HEAD_DIM, scale);
 
         /* WO + residual */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim, seq_len, q_dim, &alpha,
-            l->wo, CUDA_R_16BF, q_dim, d_attn_out, CUDA_R_32F, q_dim,
-            &beta, d_proj_out, CUDA_R_32F, dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_proj_out, d_attn_out, l->wo, seq_len, q_dim, dim);
         tts_cuda_add_inplace(d_x, d_proj_out, seq_len * dim);
 
         /* FFN */
         tts_cuda_rms_norm(d_x_norm, d_x, l->ffn_norm, seq_len, dim, TTS_DEC_NORM_EPS);
 
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            TTS_DEC_HIDDEN, seq_len, dim, &alpha,
-            l->w1, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
-            &beta, d_gate, CUDA_R_32F, TTS_DEC_HIDDEN,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_gate, d_x_norm, l->w1, seq_len, dim, TTS_DEC_HIDDEN);
 
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            TTS_DEC_HIDDEN, seq_len, dim, &alpha,
-            l->w3, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
-            &beta, d_up, CUDA_R_32F, TTS_DEC_HIDDEN,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_up, d_x_norm, l->w3, seq_len, dim, TTS_DEC_HIDDEN);
 
         tts_cuda_silu_mul(d_gate, d_up, seq_len * TTS_DEC_HIDDEN);
 
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim, seq_len, TTS_DEC_HIDDEN, &alpha,
-            l->w2, CUDA_R_16BF, TTS_DEC_HIDDEN, d_gate, CUDA_R_32F, TTS_DEC_HIDDEN,
-            &beta, d_ffn_out, CUDA_R_32F, dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(d_ffn_out, d_gate, l->w2, seq_len, TTS_DEC_HIDDEN, dim);
 
         tts_cuda_add_inplace(d_x, d_ffn_out, seq_len * dim);
     }
@@ -1056,36 +1036,21 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
     cudaMalloc(&d_xt, TTS_ACOUSTIC_DIM * sizeof(float));
     cudaMemcpy(d_xt, x_t, TTS_ACOUSTIC_DIM * sizeof(float), cudaMemcpyHostToDevice);
 
-    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        dim, 1, TTS_ACOUSTIC_DIM, &alpha,
-        g_cuda.ac_input_proj_gpu, CUDA_R_16BF, TTS_ACOUSTIC_DIM,
-        d_xt, CUDA_R_32F, TTS_ACOUSTIC_DIM,
-        &beta, d_tokens, CUDA_R_32F, dim,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    gpu_linear_bf16(d_tokens, d_xt, g_cuda.ac_input_proj_gpu, 1, TTS_ACOUSTIC_DIM, dim);
 
     /* Token 1: time_projection(time_embedding(t)) */
     int half_dim = dim / 2;
     time_embedding_kernel<<<(half_dim + 255) / 256, 256>>>(
         d_time_emb, g_cuda.ac_time_inv_freq_gpu, t_val, half_dim);
 
-    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        dim, 1, dim, &alpha,
-        g_cuda.ac_time_proj_gpu, CUDA_R_16BF, dim,
-        d_time_emb, CUDA_R_32F, dim,
-        &beta, d_tokens + dim, CUDA_R_32F, dim,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    gpu_linear_bf16(d_tokens + dim, d_time_emb, g_cuda.ac_time_proj_gpu, 1, dim, dim);
 
     /* Token 2: llm_projection(llm_hidden) */
     float *d_llm;
     cudaMalloc(&d_llm, dim * sizeof(float));
     cudaMemcpy(d_llm, llm_hidden, dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        dim, 1, dim, &alpha,
-        g_cuda.ac_llm_proj_gpu, CUDA_R_16BF, dim,
-        d_llm, CUDA_R_32F, dim,
-        &beta, d_tokens + 2 * dim, CUDA_R_32F, dim,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    gpu_linear_bf16(d_tokens + 2 * dim, d_llm, g_cuda.ac_llm_proj_gpu, 1, dim, dim);
 
     /* 3 transformer layers */
     for (int layer = 0; layer < TTS_AC_LAYERS; layer++) {
@@ -1096,21 +1061,9 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
                           seq, dim, TTS_AC_NORM_EPS);
 
         /* Q, K, V */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            q_dim, seq, dim, &alpha,
-            l->wq, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_ac_q, CUDA_R_32F, q_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            kv_dim, seq, dim, &alpha,
-            l->wk, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_ac_k, CUDA_R_32F, kv_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            kv_dim, seq, dim, &alpha,
-            l->wv, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_ac_v, CUDA_R_32F, kv_dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_ac_q, g_cuda.d_ac_tokens_norm, l->wq, seq, dim, q_dim);
+        gpu_linear_bf16(g_cuda.d_ac_k, g_cuda.d_ac_tokens_norm, l->wk, seq, dim, kv_dim);
+        gpu_linear_bf16(g_cuda.d_ac_v, g_cuda.d_ac_tokens_norm, l->wv, seq, dim, kv_dim);
 
         /* Bidirectional attention (3 tokens, no mask) */
         tts_cuda_bidirectional_attention(g_cuda.d_ac_attn_out,
@@ -1118,32 +1071,16 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
             seq, TTS_AC_HEADS, TTS_AC_KV_HEADS, TTS_AC_HEAD_DIM, scale);
 
         /* WO + residual */
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim, seq, q_dim, &alpha,
-            l->wo, CUDA_R_16BF, q_dim, g_cuda.d_ac_attn_out, CUDA_R_32F, q_dim,
-            &beta, g_cuda.d_ac_proj_out, CUDA_R_32F, dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_ac_proj_out, g_cuda.d_ac_attn_out, l->wo, seq, q_dim, dim);
         tts_cuda_add_inplace(d_tokens, g_cuda.d_ac_proj_out, seq * dim);
 
         /* FFN */
         tts_cuda_rms_norm(g_cuda.d_ac_tokens_norm, d_tokens, l->ffn_norm,
                           seq, dim, TTS_AC_NORM_EPS);
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            TTS_AC_HIDDEN, seq, dim, &alpha,
-            l->w1, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_ac_gate, CUDA_R_32F, TTS_AC_HIDDEN,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            TTS_AC_HIDDEN, seq, dim, &alpha,
-            l->w3, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
-            &beta, g_cuda.d_ac_up, CUDA_R_32F, TTS_AC_HIDDEN,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_ac_gate, g_cuda.d_ac_tokens_norm, l->w1, seq, dim, TTS_AC_HIDDEN);
+        gpu_linear_bf16(g_cuda.d_ac_up, g_cuda.d_ac_tokens_norm, l->w3, seq, dim, TTS_AC_HIDDEN);
         tts_cuda_silu_mul(g_cuda.d_ac_gate, g_cuda.d_ac_up, seq * TTS_AC_HIDDEN);
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-            dim, seq, TTS_AC_HIDDEN, &alpha,
-            l->w2, CUDA_R_16BF, TTS_AC_HIDDEN, g_cuda.d_ac_gate, CUDA_R_32F, TTS_AC_HIDDEN,
-            &beta, g_cuda.d_ac_ffn_out, CUDA_R_32F, dim,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        gpu_linear_bf16(g_cuda.d_ac_ffn_out, g_cuda.d_ac_gate, l->w2, seq, TTS_AC_HIDDEN, dim);
         tts_cuda_add_inplace(d_tokens, g_cuda.d_ac_ffn_out, seq * dim);
     }
 
@@ -1153,12 +1090,7 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
 
     float *d_vel;
     cudaMalloc(&d_vel, TTS_ACOUSTIC_DIM * sizeof(float));
-    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        TTS_ACOUSTIC_DIM, 1, dim, &alpha,
-        g_cuda.ac_acoustic_out_gpu, CUDA_R_16BF, dim,
-        g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
-        &beta, d_vel, CUDA_R_32F, TTS_ACOUSTIC_DIM,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    gpu_linear_bf16(d_vel, g_cuda.d_ac_tokens_norm, g_cuda.ac_acoustic_out_gpu, 1, dim, TTS_ACOUSTIC_DIM);
 
     /* Download velocity to CPU */
     cudaMemcpy(out_velocity, d_vel, TTS_ACOUSTIC_DIM * sizeof(float),
