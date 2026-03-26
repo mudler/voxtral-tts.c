@@ -2,6 +2,8 @@
 
 Pure C inference engine for [Mistral's Voxtral-4B-TTS](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603) text-to-speech model. Zero external dependencies beyond the C standard library and math. Reads weights directly from safetensors via memory-mapped I/O.
 
+Sample: [Hello world](./hello_world.wav)
+
 ## Features
 
 - Single-file model loading from `consolidated.safetensors`
