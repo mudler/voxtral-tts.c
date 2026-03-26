@@ -71,8 +71,24 @@ inspect: voxtral_tts_safetensors.o inspect_weights.o
 inspect_weights.o: inspect_weights.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Test harness (CUDA)
+test-cuda: CFLAGS += -DUSE_CUDA -DUSE_BLAS
+test-cuda: voxtral_tts_kernels.o voxtral_tts_cuda.o test_kernels.o
+	$(CC) $(CFLAGS) -o test_kernels $^ $(LDFLAGS) $(CUDA_LDFLAGS)
+
+test_kernels.o: test_kernels.c voxtral_tts.h voxtral_tts_kernels.h voxtral_tts_cuda.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Test harness (CPU only)
+test-cpu: CFLAGS += -DUSE_BLAS
+test-cpu: voxtral_tts_kernels.o test_kernels_cpu.o
+	$(CC) $(CFLAGS) -o test_kernels $^ $(LDFLAGS) -lopenblas
+
+test_kernels_cpu.o: test_kernels.c voxtral_tts.h voxtral_tts_kernels.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
-	rm -f $(OBJS) voxtral_tts_cuda.o $(TARGET) inspect_weights inspect_weights.o
+	rm -f $(OBJS) voxtral_tts_cuda.o test_kernels.o test_kernels_cpu.o $(TARGET) test_kernels inspect_weights inspect_weights.o
 
 # Dependencies
 voxtral_tts.o: voxtral_tts.c voxtral_tts.h voxtral_tts_safetensors.h voxtral_tts_kernels.h
@@ -86,4 +102,4 @@ voxtral_tts_wav.o: voxtral_tts_wav.c voxtral_tts.h
 voxtral_tts_tokenizer.o: voxtral_tts_tokenizer.c voxtral_tts.h
 main.o: main.c voxtral_tts.h
 
-.PHONY: all blas apple cuda noblas clean inspect
+.PHONY: all blas apple cuda noblas clean inspect test-cuda test-cpu
