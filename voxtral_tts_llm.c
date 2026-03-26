@@ -276,6 +276,13 @@ void tts_llm_prefill(tts_ctx_t *ctx, const float *embeds, int seq_len) {
      * embeds: [seq_len, 3072]
      * Updates KV cache. Does not return hidden states (only need last one).
      */
+#ifdef USE_CUDA
+    if (tts_cuda_available()) {
+        tts_cuda_llm_prefill(embeds, seq_len, ctx->kv_cache_len);
+        ctx->kv_cache_len += seq_len;
+        return;
+    }
+#endif
     tts_decoder_t *dec = &ctx->decoder;
     int dim = TTS_DEC_DIM;
     int q_dim = TTS_DEC_HEADS * TTS_DEC_HEAD_DIM;

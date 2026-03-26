@@ -141,7 +141,8 @@ void tts_cuda_causal_attention_decode(
 /* Causal attention for prefill (multi-token) */
 void tts_cuda_causal_attention_prefill(
     float *d_out, const float *d_Q, const float *d_K, const float *d_V,
-    int seq_len, int n_heads, int n_kv_heads, int head_dim, float scale);
+    int seq_len, int start_pos,
+    int n_heads, int n_kv_heads, int head_dim, float scale);
 
 /* Bidirectional attention on GPU (for acoustic transformer, 3 tokens) */
 void tts_cuda_bidirectional_attention(

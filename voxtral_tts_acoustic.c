@@ -182,6 +182,12 @@ static void compute_time_embedding(const tts_acoustic_t *ac, float t_val,
 static void predict_velocity(tts_ctx_t *ctx, const float *x_t,
                               const float *llm_hidden, float t_val,
                               float *out_velocity) {
+#ifdef USE_CUDA
+    if (tts_cuda_available()) {
+        tts_cuda_predict_velocity(out_velocity, x_t, llm_hidden, t_val);
+        return;
+    }
+#endif
     tts_acoustic_t *ac = &ctx->acoustic;
     int dim = TTS_AC_DIM;
     int seq = 3;

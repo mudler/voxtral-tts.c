@@ -790,27 +790,379 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
 
 /* ========================================================================
  * GPU LLM Prefill (multi-token)
+ *
+ * Processes all prompt tokens through 26 layers on GPU.
+ * Populates KV cache for subsequent autoregressive decode.
  * ======================================================================== */
 
 extern "C" void tts_cuda_llm_prefill(const float *embeds, int seq_len, int start_pos) {
-    /* TODO: Implement GPU prefill with batched GEMM.
-     * For now, fall back to CPU prefill (still fast for ~225 tokens).
-     * The main bottleneck is per-token decode, not prefill. */
-    (void)embeds; (void)seq_len; (void)start_pos;
-    fprintf(stderr, "  cuda: prefill not yet GPU-accelerated, using CPU\n");
+    int dim = TTS_DEC_DIM;
+    int q_dim = TTS_DEC_HEADS * TTS_DEC_HEAD_DIM;
+    int kv_dim = TTS_DEC_KV_HEADS * TTS_DEC_HEAD_DIM;
+    float scale = 1.0f / sqrtf((float)TTS_DEC_HEAD_DIM);
+    cublasHandle_t handle = (cublasHandle_t)g_cuda.cublas_handle;
+    float alpha = 1.0f, beta = 0.0f;
+
+    /* Allocate temporary GPU buffers for multi-token */
+    float *d_x, *d_x_norm, *d_q, *d_k, *d_v;
+    float *d_attn_out, *d_proj_out, *d_gate, *d_up, *d_ffn_out;
+    size_t sz_dim = (size_t)seq_len * dim * sizeof(float);
+    size_t sz_q = (size_t)seq_len * q_dim * sizeof(float);
+    size_t sz_kv = (size_t)seq_len * kv_dim * sizeof(float);
+    size_t sz_hid = (size_t)seq_len * TTS_DEC_HIDDEN * sizeof(float);
+
+    cudaMalloc(&d_x, sz_dim);
+    cudaMalloc(&d_x_norm, sz_dim);
+    cudaMalloc(&d_q, sz_q);
+    cudaMalloc(&d_k, sz_kv);
+    cudaMalloc(&d_v, sz_kv);
+    cudaMalloc(&d_attn_out, sz_q);
+    cudaMalloc(&d_proj_out, sz_dim);
+    cudaMalloc(&d_gate, sz_hid);
+    cudaMalloc(&d_up, sz_hid);
+    cudaMalloc(&d_ffn_out, sz_dim);
+
+    /* Upload embeddings */
+    cudaMemcpy(d_x, embeds, sz_dim, cudaMemcpyHostToDevice);
+
+    for (int layer = 0; layer < TTS_DEC_LAYERS; layer++) {
+        tts_cuda_layer_weights_t *l = &g_cuda.dec_layers[layer];
+
+        /* RMSNorm */
+        tts_cuda_rms_norm(d_x_norm, d_x, l->attention_norm, seq_len, dim, TTS_DEC_NORM_EPS);
+
+        /* Q, K, V projections (batched) */
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            q_dim, seq_len, dim, &alpha,
+            l->wq, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
+            &beta, d_q, CUDA_R_32F, q_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            kv_dim, seq_len, dim, &alpha,
+            l->wk, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
+            &beta, d_k, CUDA_R_32F, kv_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            kv_dim, seq_len, dim, &alpha,
+            l->wv, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
+            &beta, d_v, CUDA_R_32F, kv_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        /* Apply RoPE to all positions */
+        for (int s = 0; s < seq_len; s++) {
+            rope_kernel<<<TTS_DEC_HEADS, TTS_DEC_HEAD_DIM / 2>>>(
+                d_q + s * q_dim, TTS_DEC_HEADS, TTS_DEC_HEAD_DIM,
+                q_dim, start_pos + s, TTS_ROPE_THETA);
+            rope_kernel<<<TTS_DEC_KV_HEADS, TTS_DEC_HEAD_DIM / 2>>>(
+                d_k + s * kv_dim, TTS_DEC_KV_HEADS, TTS_DEC_HEAD_DIM,
+                kv_dim, start_pos + s, TTS_ROPE_THETA);
+        }
+
+        /* Store K, V in GPU KV cache */
+        float *layer_k = g_cuda.kv_cache_k_gpu + (size_t)layer * g_cuda.kv_cache_max * kv_dim;
+        float *layer_v = g_cuda.kv_cache_v_gpu + (size_t)layer * g_cuda.kv_cache_max * kv_dim;
+        cudaMemcpy(layer_k + (size_t)start_pos * kv_dim, d_k, sz_kv, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(layer_v + (size_t)start_pos * kv_dim, d_v, sz_kv, cudaMemcpyDeviceToDevice);
+
+        /* Self-attention (prefill: all seq_len queries attend to all seq_len keys) */
+        tts_cuda_causal_attention_prefill(
+            d_attn_out, d_q, layer_k, layer_v,
+            seq_len, start_pos, TTS_DEC_HEADS, TTS_DEC_KV_HEADS, TTS_DEC_HEAD_DIM, scale);
+
+        /* WO + residual */
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            dim, seq_len, q_dim, &alpha,
+            l->wo, CUDA_R_16BF, q_dim, d_attn_out, CUDA_R_32F, q_dim,
+            &beta, d_proj_out, CUDA_R_32F, dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        tts_cuda_add_inplace(d_x, d_proj_out, seq_len * dim);
+
+        /* FFN */
+        tts_cuda_rms_norm(d_x_norm, d_x, l->ffn_norm, seq_len, dim, TTS_DEC_NORM_EPS);
+
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            TTS_DEC_HIDDEN, seq_len, dim, &alpha,
+            l->w1, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
+            &beta, d_gate, CUDA_R_32F, TTS_DEC_HIDDEN,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            TTS_DEC_HIDDEN, seq_len, dim, &alpha,
+            l->w3, CUDA_R_16BF, dim, d_x_norm, CUDA_R_32F, dim,
+            &beta, d_up, CUDA_R_32F, TTS_DEC_HIDDEN,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        tts_cuda_silu_mul(d_gate, d_up, seq_len * TTS_DEC_HIDDEN);
+
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            dim, seq_len, TTS_DEC_HIDDEN, &alpha,
+            l->w2, CUDA_R_16BF, TTS_DEC_HIDDEN, d_gate, CUDA_R_32F, TTS_DEC_HIDDEN,
+            &beta, d_ffn_out, CUDA_R_32F, dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        tts_cuda_add_inplace(d_x, d_ffn_out, seq_len * dim);
+    }
+
+    /* No need to download — KV cache is populated on GPU */
+    cudaFree(d_x); cudaFree(d_x_norm);
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+    cudaFree(d_attn_out); cudaFree(d_proj_out);
+    cudaFree(d_gate); cudaFree(d_up); cudaFree(d_ffn_out);
 }
 
 /* ========================================================================
- * GPU Acoustic Transformer Velocity Prediction
+ * Causal Attention for Prefill (multi-query, multi-key)
+ *
+ * Simple approach: use cuBLAS for QK^T, then custom softmax+mask kernel.
  * ======================================================================== */
+
+__global__ void causal_mask_softmax_kernel(float *scores, int seq_q, int seq_k,
+                                            int start_pos) {
+    int h = blockIdx.x;
+    int i = blockIdx.y; /* query position */
+    float *row = scores + (size_t)h * seq_q * seq_k + i * seq_k;
+    int global_i = start_pos + i;
+
+    /* Apply causal mask: can only attend to positions <= global_i */
+    float max_val = -1e30f;
+    for (int j = threadIdx.x; j <= global_i && j < seq_k; j += blockDim.x) {
+        if (row[j] > max_val) max_val = row[j];
+    }
+    /* Warp reduce max */
+    for (int offset = 16; offset > 0; offset >>= 1)
+        max_val = fmaxf(max_val, __shfl_down_sync(0xFFFFFFFF, max_val, offset));
+    max_val = __shfl_sync(0xFFFFFFFF, max_val, 0);
+
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < seq_k; j += blockDim.x) {
+        if (j <= global_i) {
+            row[j] = expf(row[j] - max_val);
+            sum += row[j];
+        } else {
+            row[j] = 0.0f;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    sum = __shfl_sync(0xFFFFFFFF, sum, 0);
+
+    float inv_sum = 1.0f / (sum + 1e-10f);
+    for (int j = threadIdx.x; j < seq_k; j += blockDim.x) {
+        row[j] *= inv_sum;
+    }
+}
+
+extern "C" void tts_cuda_causal_attention_prefill(
+    float *d_out, const float *d_Q, const float *d_K, const float *d_V,
+    int seq_len, int start_pos,
+    int n_heads, int n_kv_heads, int head_dim, float scale) {
+
+    cublasHandle_t handle = (cublasHandle_t)g_cuda.cublas_handle;
+    int heads_per_kv = n_heads / n_kv_heads;
+
+    /* Allocate score matrix [n_heads, seq_len, seq_k] */
+    int seq_k = start_pos + seq_len;
+    float *d_scores;
+    cudaMalloc(&d_scores, (size_t)n_heads * seq_len * seq_k * sizeof(float));
+
+    /* For each head group, compute QK^T */
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / heads_per_kv;
+        /* Q_h: [seq_len, head_dim] stride = n_heads*head_dim, offset = h*head_dim
+         * K_h: [seq_k, head_dim] stride = n_kv_heads*head_dim, offset = kv_h*head_dim
+         * We need strided batch GEMM or manual loop.
+         * For simplicity, use manual per-head GEMM: */
+        /* Actually, data is interleaved: Q[s, h*hd + d]. We need to extract per-head. */
+        /* Simpler: fall back to per-head attention for prefill (still GPU-accelerated) */
+    }
+
+    /* For now, use a simpler per-head approach similar to decode kernel */
+    /* Each block handles one (head, query) pair */
+    dim3 grid(n_heads, seq_len);
+    int threads = min(seq_k, 256);
+    if (threads < 32) threads = 32;
+
+    /* First compute scores on CPU-style but on GPU with a simple kernel */
+    /* TODO: This is a placeholder — proper prefill attention needs strided batch GEMM
+     * or a tiled Flash Attention kernel. For now, use a simple but correct kernel. */
+
+    /* Simple approach: launch per-head, per-query kernels */
+    /* For ~225 tokens this is OK — not the bottleneck */
+
+    /* Fall back to the decode-style kernel called seq_len times.
+     * Each call does one query position against all keys up to that point. */
+    for (int i = 0; i < seq_len; i++) {
+        int q_offset = i * (n_heads * head_dim);
+        int total_k = start_pos + i + 1;
+
+        /* Reuse decode kernel for each query position */
+        int t = min(total_k, 256);
+        if (t < 32) t = 32;
+        size_t smem = total_k * sizeof(float);
+        if (smem > 48 * 1024) smem = 48 * 1024; /* cap shared mem */
+
+        causal_attention_decode_kernel<<<n_heads, t, smem>>>(
+            d_out + q_offset,
+            d_Q + q_offset,
+            d_K, d_V,
+            total_k, n_kv_heads, head_dim, scale,
+            heads_per_kv, 0);
+    }
+
+    cudaFree(d_scores);
+}
+
+/* ========================================================================
+ * GPU Acoustic Transformer - Predict Velocity
+ *
+ * Runs 3-layer bidirectional transformer on GPU.
+ * Input: x_t[36], llm_hidden[3072], t_val (scalar)
+ * Output: velocity[36]
+ * ======================================================================== */
+
+/* Time embedding kernel */
+__global__ void time_embedding_kernel(float *out, const float *inv_freq,
+                                       float t_val, int half_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < half_dim) {
+        float angle = t_val * inv_freq[i];
+        out[i] = cosf(angle);
+        out[half_dim + i] = sinf(angle);
+    }
+}
 
 extern "C" void tts_cuda_predict_velocity(float *out_velocity,
                                             const float *x_t,
                                             const float *llm_hidden,
                                             float t_val) {
-    /* TODO: Implement GPU acoustic transformer forward.
-     * The acoustic transformer is small (3 tokens, 3 layers) so
-     * the GPU overhead per-call may not be worth it for the
-     * current 14 calls per frame. But for batch inference it helps. */
-    (void)out_velocity; (void)x_t; (void)llm_hidden; (void)t_val;
+    int dim = TTS_AC_DIM;
+    int seq = 3;
+    int q_dim = TTS_AC_HEADS * TTS_AC_HEAD_DIM;
+    int kv_dim = TTS_AC_KV_HEADS * TTS_AC_HEAD_DIM;
+    float scale = 1.0f / sqrtf((float)TTS_AC_HEAD_DIM);
+    cublasHandle_t handle = (cublasHandle_t)g_cuda.cublas_handle;
+    float alpha = 1.0f, beta = 0.0f;
+
+    float *d_tokens = g_cuda.d_ac_tokens;
+    float *d_time_emb;
+    cudaMalloc(&d_time_emb, dim * sizeof(float));
+
+    /* Build 3 tokens on GPU */
+
+    /* Token 0: input_projection(x_t) [36] -> [3072] */
+    float *d_xt;
+    cudaMalloc(&d_xt, TTS_ACOUSTIC_DIM * sizeof(float));
+    cudaMemcpy(d_xt, x_t, TTS_ACOUSTIC_DIM * sizeof(float), cudaMemcpyHostToDevice);
+
+    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        dim, 1, TTS_ACOUSTIC_DIM, &alpha,
+        g_cuda.ac_input_proj_gpu, CUDA_R_16BF, TTS_ACOUSTIC_DIM,
+        d_xt, CUDA_R_32F, TTS_ACOUSTIC_DIM,
+        &beta, d_tokens, CUDA_R_32F, dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Token 1: time_projection(time_embedding(t)) */
+    int half_dim = dim / 2;
+    time_embedding_kernel<<<(half_dim + 255) / 256, 256>>>(
+        d_time_emb, g_cuda.ac_time_inv_freq_gpu, t_val, half_dim);
+
+    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        dim, 1, dim, &alpha,
+        g_cuda.ac_time_proj_gpu, CUDA_R_16BF, dim,
+        d_time_emb, CUDA_R_32F, dim,
+        &beta, d_tokens + dim, CUDA_R_32F, dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Token 2: llm_projection(llm_hidden) */
+    float *d_llm;
+    cudaMalloc(&d_llm, dim * sizeof(float));
+    cudaMemcpy(d_llm, llm_hidden, dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        dim, 1, dim, &alpha,
+        g_cuda.ac_llm_proj_gpu, CUDA_R_16BF, dim,
+        d_llm, CUDA_R_32F, dim,
+        &beta, d_tokens + 2 * dim, CUDA_R_32F, dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* 3 transformer layers */
+    for (int layer = 0; layer < TTS_AC_LAYERS; layer++) {
+        tts_cuda_layer_weights_t *l = &g_cuda.ac_layers[layer];
+
+        /* RMSNorm */
+        tts_cuda_rms_norm(g_cuda.d_ac_tokens_norm, d_tokens, l->attention_norm,
+                          seq, dim, TTS_AC_NORM_EPS);
+
+        /* Q, K, V */
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            q_dim, seq, dim, &alpha,
+            l->wq, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
+            &beta, g_cuda.d_ac_q, CUDA_R_32F, q_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            kv_dim, seq, dim, &alpha,
+            l->wk, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
+            &beta, g_cuda.d_ac_k, CUDA_R_32F, kv_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            kv_dim, seq, dim, &alpha,
+            l->wv, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
+            &beta, g_cuda.d_ac_v, CUDA_R_32F, kv_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        /* Bidirectional attention (3 tokens, no mask) */
+        tts_cuda_bidirectional_attention(g_cuda.d_ac_attn_out,
+            g_cuda.d_ac_q, g_cuda.d_ac_k, g_cuda.d_ac_v,
+            seq, TTS_AC_HEADS, TTS_AC_KV_HEADS, TTS_AC_HEAD_DIM, scale);
+
+        /* WO + residual */
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            dim, seq, q_dim, &alpha,
+            l->wo, CUDA_R_16BF, q_dim, g_cuda.d_ac_attn_out, CUDA_R_32F, q_dim,
+            &beta, g_cuda.d_ac_proj_out, CUDA_R_32F, dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        tts_cuda_add_inplace(d_tokens, g_cuda.d_ac_proj_out, seq * dim);
+
+        /* FFN */
+        tts_cuda_rms_norm(g_cuda.d_ac_tokens_norm, d_tokens, l->ffn_norm,
+                          seq, dim, TTS_AC_NORM_EPS);
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            TTS_AC_HIDDEN, seq, dim, &alpha,
+            l->w1, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
+            &beta, g_cuda.d_ac_gate, CUDA_R_32F, TTS_AC_HIDDEN,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            TTS_AC_HIDDEN, seq, dim, &alpha,
+            l->w3, CUDA_R_16BF, dim, g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
+            &beta, g_cuda.d_ac_up, CUDA_R_32F, TTS_AC_HIDDEN,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        tts_cuda_silu_mul(g_cuda.d_ac_gate, g_cuda.d_ac_up, seq * TTS_AC_HIDDEN);
+        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            dim, seq, TTS_AC_HIDDEN, &alpha,
+            l->w2, CUDA_R_16BF, TTS_AC_HIDDEN, g_cuda.d_ac_gate, CUDA_R_32F, TTS_AC_HIDDEN,
+            &beta, g_cuda.d_ac_ffn_out, CUDA_R_32F, dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        tts_cuda_add_inplace(d_tokens, g_cuda.d_ac_ffn_out, seq * dim);
+    }
+
+    /* Final norm on first token, then project to velocity */
+    tts_cuda_rms_norm(g_cuda.d_ac_tokens_norm, d_tokens, g_cuda.ac_norm_gpu,
+                      1, dim, TTS_AC_NORM_EPS);
+
+    float *d_vel;
+    cudaMalloc(&d_vel, TTS_ACOUSTIC_DIM * sizeof(float));
+    cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        TTS_ACOUSTIC_DIM, 1, dim, &alpha,
+        g_cuda.ac_acoustic_out_gpu, CUDA_R_16BF, dim,
+        g_cuda.d_ac_tokens_norm, CUDA_R_32F, dim,
+        &beta, d_vel, CUDA_R_32F, TTS_ACOUSTIC_DIM,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    /* Download velocity to CPU */
+    cudaMemcpy(out_velocity, d_vel, TTS_ACOUSTIC_DIM * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    cudaFree(d_xt); cudaFree(d_time_emb); cudaFree(d_llm); cudaFree(d_vel);
 }
