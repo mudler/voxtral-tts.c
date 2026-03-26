@@ -19,6 +19,9 @@
 #ifdef USE_CUDA
 #include "voxtral_tts_cuda.h"
 #endif
+#ifdef USE_METAL
+#include "voxtral_tts_metal.h"
+#endif
 
 /* ========================================================================
  * Weight Loading
@@ -117,8 +120,17 @@ int tts_llm_kv_cache_alloc(tts_ctx_t *ctx, int max_seq) {
     size_t elems = (size_t)TTS_DEC_LAYERS * max_seq * kv_dim;
     size_t bytes = elems * sizeof(float);
 
-    ctx->kv_cache_k = (float *)calloc(1, bytes);
-    ctx->kv_cache_v = (float *)calloc(1, bytes);
+#ifdef USE_METAL
+    if (tts_metal_available()) {
+        /* Shared GPU-CPU buffer: zero-copy access from both sides */
+        ctx->kv_cache_k = (float *)tts_metal_shared_alloc(bytes);
+        ctx->kv_cache_v = (float *)tts_metal_shared_alloc(bytes);
+    } else
+#endif
+    {
+        ctx->kv_cache_k = (float *)calloc(1, bytes);
+        ctx->kv_cache_v = (float *)calloc(1, bytes);
+    }
 
     if (!ctx->kv_cache_k || !ctx->kv_cache_v) {
         fprintf(stderr, "llm: failed to allocate KV cache (%.1f MB)\n",
@@ -177,6 +189,13 @@ void tts_llm_forward(tts_ctx_t *ctx, const float *input_embed, float *out_hidden
 #ifdef USE_CUDA
     if (tts_cuda_available()) {
         tts_cuda_llm_forward(out_hidden, input_embed, ctx->kv_cache_len);
+        ctx->kv_cache_len++;
+        return;
+    }
+#endif
+#ifdef USE_METAL
+    if (tts_metal_available()) {
+        tts_metal_llm_forward(ctx, input_embed, out_hidden, ctx->kv_cache_len);
         ctx->kv_cache_len++;
         return;
     }

@@ -90,7 +90,15 @@ tts_ctx_t *tts_load(const char *model_dir) {
         return NULL;
     }
 
-    /* Initialize CUDA and upload weights to GPU (if available) */
+    /* Initialize GPU backend */
+#ifdef USE_METAL
+    fprintf(stderr, "Initializing Metal...\n");
+    if (tts_metal_init()) {
+        fprintf(stderr, "  Metal GPU acceleration enabled\n");
+    } else {
+        fprintf(stderr, "  Metal not available, using CPU\n");
+    }
+#endif
 #ifdef USE_CUDA
     fprintf(stderr, "Initializing CUDA...\n");
     if (tts_cuda_init(ctx->kv_cache_max) == 0) {
@@ -111,6 +119,9 @@ void tts_free(tts_ctx_t *ctx) {
 
 #ifdef USE_CUDA
     tts_cuda_free();
+#endif
+#ifdef USE_METAL
+    tts_metal_shutdown();
 #endif
 
     /* Close safetensors (unmaps memory, invalidates bf16 pointers) */

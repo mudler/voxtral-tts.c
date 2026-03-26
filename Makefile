@@ -41,10 +41,27 @@ blas: CFLAGS += -DUSE_BLAS
 blas: LDFLAGS += -lopenblas
 blas: $(TARGET)
 
-# macOS with Accelerate
+# macOS with Accelerate (CPU only)
 apple: CFLAGS += -DUSE_BLAS
 apple: LDFLAGS += -framework Accelerate
 apple: $(TARGET)
+
+# macOS with Metal GPU + Accelerate
+METAL_CFLAGS = -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
+METAL_OBJCFLAGS = $(CFLAGS) $(METAL_CFLAGS) -fobjc-arc
+METAL_LDFLAGS = -framework Accelerate -framework Metal \
+                -framework MetalPerformanceShaders -framework Foundation
+
+apple-gpu: CFLAGS += $(METAL_CFLAGS)
+apple-gpu: LDFLAGS += $(METAL_LDFLAGS)
+apple-gpu: $(OBJS) voxtral_tts_metal.o
+	$(CC) $(CFLAGS) -o $(TARGET) $^ $(LDFLAGS)
+
+voxtral_tts_shaders_source.h: voxtral_tts_shaders.metal
+	xxd -i $< > $@
+
+voxtral_tts_metal.o: voxtral_tts_metal.m voxtral_tts_metal.h voxtral_tts.h voxtral_tts_shaders_source.h
+	$(CC) $(METAL_OBJCFLAGS) -c -o $@ $<
 
 # CUDA + OpenBLAS
 cuda: CFLAGS += -DUSE_CUDA -DUSE_BLAS
@@ -88,7 +105,7 @@ test_kernels_cpu.o: test_kernels.c voxtral_tts.h voxtral_tts_kernels.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) voxtral_tts_cuda.o test_kernels.o test_kernels_cpu.o $(TARGET) test_kernels inspect_weights inspect_weights.o
+	rm -f $(OBJS) voxtral_tts_cuda.o voxtral_tts_metal.o voxtral_tts_shaders_source.h test_kernels.o test_kernels_cpu.o $(TARGET) test_kernels inspect_weights inspect_weights.o
 
 # Dependencies
 voxtral_tts.o: voxtral_tts.c voxtral_tts.h voxtral_tts_safetensors.h voxtral_tts_kernels.h
@@ -102,4 +119,4 @@ voxtral_tts_wav.o: voxtral_tts_wav.c voxtral_tts.h
 voxtral_tts_tokenizer.o: voxtral_tts_tokenizer.c voxtral_tts.h
 main.o: main.c voxtral_tts.h
 
-.PHONY: all blas apple cuda noblas clean inspect test-cuda test-cpu
+.PHONY: all blas apple apple-gpu cuda noblas clean inspect test-cuda test-cpu
