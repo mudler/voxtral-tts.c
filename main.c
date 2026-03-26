@@ -38,6 +38,7 @@ int main(int argc, char *argv[]) {
     uint64_t seed = 0;
     int verbose = 0;
     int inspect = 0;
+    int max_frames = 2000;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -49,6 +50,8 @@ int main(int argc, char *argv[]) {
             output = argv[++i];
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             seed = (uint64_t)atoll(argv[++i]);
+        } else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
+            max_frames = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-V") == 0) {
             verbose++;
         } else if (strcmp(argv[i], "--inspect") == 0) {
