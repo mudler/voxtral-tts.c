@@ -90,12 +90,28 @@ tts_ctx_t *tts_load(const char *model_dir) {
         return NULL;
     }
 
+    /* Initialize CUDA and upload weights to GPU (if available) */
+#ifdef USE_CUDA
+    fprintf(stderr, "Initializing CUDA...\n");
+    if (tts_cuda_init(ctx->kv_cache_max) == 0) {
+        fprintf(stderr, "Uploading weights to GPU...\n");
+        tts_cuda_upload_llm_weights(&ctx->decoder);
+        tts_cuda_upload_acoustic_weights(&ctx->acoustic);
+    } else {
+        fprintf(stderr, "CUDA not available, using CPU\n");
+    }
+#endif
+
     fprintf(stderr, "Model loaded successfully.\n");
     return ctx;
 }
 
 void tts_free(tts_ctx_t *ctx) {
     if (!ctx) return;
+
+#ifdef USE_CUDA
+    tts_cuda_free();
+#endif
 
     /* Close safetensors (unmaps memory, invalidates bf16 pointers) */
     if (ctx->safetensors) safetensors_close((safetensors_file_t *)ctx->safetensors);

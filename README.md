@@ -36,12 +36,22 @@ The LLM autoregressively generates hidden states conditioned on text and a voice
 # Linux with OpenBLAS (recommended)
 make blas
 
+# CUDA + OpenBLAS (requires NVIDIA GPU + CUDA toolkit)
+make cuda
+
+# Specify GPU architecture (default: sm_80 for Ampere)
+make cuda CUDA_ARCH=sm_89   # Ada Lovelace (RTX 4090)
+make cuda CUDA_ARCH=sm_90   # Hopper (H100)
+make cuda CUDA_ARCH=sm_100  # Blackwell (B200)
+
 # macOS with Accelerate
 make apple
 
 # Portable (no BLAS, slower)
 make noblas
 ```
+
+The CUDA build uploads all model weights to GPU VRAM and runs the full 26-layer LLM forward pass on GPU using cuBLAS for GEMM and custom CUDA kernels for RMS norm, RoPE, attention, and SwiGLU activation.
 
 ### Download Model
 

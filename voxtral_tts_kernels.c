@@ -11,6 +11,8 @@
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#elif defined(USE_NVPL_BLAS)
+#include <nvpl_blas_cblas.h>
 #else
 #include <cblas.h>
 #endif

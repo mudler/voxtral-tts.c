@@ -170,6 +170,13 @@ void tts_llm_forward(tts_ctx_t *ctx, const float *input_embed, float *out_hidden
      * input_embed: [3072] (token embedding or audio code embedding)
      * out_hidden: [3072] (hidden state at last position, before output projection)
      */
+#ifdef USE_CUDA
+    if (tts_cuda_available()) {
+        tts_cuda_llm_forward(out_hidden, input_embed, ctx->kv_cache_len);
+        ctx->kv_cache_len++;
+        return;
+    }
+#endif
     tts_decoder_t *dec = &ctx->decoder;
     int dim = TTS_DEC_DIM;
     int q_dim = TTS_DEC_HEADS * TTS_DEC_HEAD_DIM;
