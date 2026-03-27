@@ -93,7 +93,6 @@ static inline uint16_t bf16_to_f16(uint16_t bf16) {
 static id<MTLBuffer> get_cached_f16_buffer(const uint16_t *weights, size_t num_elements) {
     pthread_mutex_lock(&g_f16_cache_mutex);
 
-    /* Cache hit? */
     for (int i = 0; i < g_f16_cache_count; i++) {
         if (g_f16_cache[i].cpu_ptr == (const void *)weights) {
             id<MTLBuffer> buf = g_f16_cache[i].gpu_buffer;
@@ -102,18 +101,15 @@ static id<MTLBuffer> get_cached_f16_buffer(const uint16_t *weights, size_t num_e
         }
     }
 
-    /* Convert bf16 -> f16 on CPU */
     uint16_t *f16_data = (uint16_t *)malloc(num_elements * sizeof(uint16_t));
     for (size_t i = 0; i < num_elements; i++)
         f16_data[i] = bf16_to_f16(weights[i]);
 
-    /* Upload to GPU */
     id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
                                               length:num_elements * sizeof(uint16_t)
-                                             options:MTLResourceStorageModeManaged];
+                                             options:MTLResourceStorageModeShared];
     free(f16_data);
 
-    /* Cache */
     if (g_f16_cache_count < F16_WEIGHT_CACHE_SIZE) {
         g_f16_cache[g_f16_cache_count].cpu_ptr = (const void *)weights;
         g_f16_cache[g_f16_cache_count].gpu_buffer = buf;
@@ -411,20 +407,17 @@ void tts_metal_shutdown(void) {
 void tts_metal_sgemm_bf16(int M, int N, int K,
                            const float *A, const uint16_t *B_bf16, float *C) {
     @autoreleasepool {
-        /* Get f16 weight buffer (cached) */
+        /* Convert bf16 -> f16 for weights (half memory, good enough for most layers).
+         * Apple Silicon unified memory means shared buffers are zero-copy. */
         id<MTLBuffer> bufB = get_cached_f16_buffer(B_bf16, (size_t)N * K);
 
-        /* Get/create f32 activation and output buffers */
         id<MTLBuffer> bufA = [g_device newBufferWithBytes:A
                                                    length:(size_t)M * K * sizeof(float)
                                                   options:MTLResourceStorageModeShared];
         id<MTLBuffer> bufC = [g_device newBufferWithLength:(size_t)M * N * sizeof(float)
                                                    options:MTLResourceStorageModeShared];
 
-        /* Create MPS matrix descriptors
-         * MPS uses row-major by default.
-         * We want C = A @ B^T: A[M,K] @ B[N,K]^T -> C[M,N]
-         * MPS: C = A * B^T where A is [M,K], B is [N,K] */
+        /* Mixed precision: f32 activations x f16 weights -> f32 output */
         MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
             matrixDescriptorWithRows:M columns:K rowBytes:K * sizeof(float)
             dataType:MPSDataTypeFloat32];
@@ -643,7 +636,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
 
             /* Q = x_norm @ Wq^T */
             MPSMatrixDescriptor *descX1 = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:dim rowBytes:dim*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:dim rowBytes:dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matXnorm = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descX1];
 
             MPSMatrixDescriptor *descWq = [MPSMatrixDescriptor
@@ -651,7 +644,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
             MPSMatrix *matWq = [[MPSMatrix alloc] initWithBuffer:bufWq descriptor:descWq];
 
             MPSMatrixDescriptor *descQ = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:q_dim rowBytes:q_dim*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:q_dim rowBytes:q_dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matQ = [[MPSMatrix alloc] initWithBuffer:bufQKV descriptor:descQ];
 
             MPSMatrixMultiplication *mmQ = [[MPSMatrixMultiplication alloc]
@@ -761,7 +754,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
             /* === WO projection === */
             id<MTLBuffer> bufWo = get_cached_f16_buffer(l->wo_bf16, (size_t)dim * q_dim);
             MPSMatrixDescriptor *descAttn = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:q_dim rowBytes:q_dim*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:q_dim rowBytes:q_dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matAttn = [[MPSMatrix alloc] initWithBuffer:bufAttn descriptor:descAttn];
 
             MPSMatrixDescriptor *descWo = [MPSMatrixDescriptor
@@ -769,7 +762,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
             MPSMatrix *matWo = [[MPSMatrix alloc] initWithBuffer:bufWo descriptor:descWo];
 
             MPSMatrixDescriptor *descProj = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:dim rowBytes:dim*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:dim rowBytes:dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matProj = [[MPSMatrix alloc] initWithBuffer:bufProj descriptor:descProj];
 
             MPSMatrixMultiplication *mmWo = [[MPSMatrixMultiplication alloc]
@@ -811,7 +804,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
                 matrixDescriptorWithRows:hidden columns:dim rowBytes:dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matW1 = [[MPSMatrix alloc] initWithBuffer:bufW1 descriptor:descW1];
             MPSMatrixDescriptor *descGate = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:hidden rowBytes:hidden*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:hidden rowBytes:hidden*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matGate = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descGate];
             MPSMatrixMultiplication *mmW1 = [[MPSMatrixMultiplication alloc]
                 initWithDevice:g_device transposeLeft:NO transposeRight:YES
@@ -824,7 +817,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
                 matrixDescriptorWithRows:hidden columns:dim rowBytes:dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matW3 = [[MPSMatrix alloc] initWithBuffer:bufW3 descriptor:descW3];
             MPSMatrixDescriptor *descUp = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:hidden rowBytes:hidden*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:hidden rowBytes:hidden*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matUp = [[MPSMatrix alloc] initWithBuffer:bufUp descriptor:descUp];
             MPSMatrixMultiplication *mmW3 = [[MPSMatrixMultiplication alloc]
                 initWithDevice:g_device transposeLeft:NO transposeRight:YES
@@ -849,7 +842,7 @@ void tts_metal_llm_forward(void *ctx_ptr, const float *input_embed,
                 matrixDescriptorWithRows:dim columns:hidden rowBytes:hidden*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matW2 = [[MPSMatrix alloc] initWithBuffer:bufW2 descriptor:descW2];
             MPSMatrixDescriptor *descFfnOut = [MPSMatrixDescriptor
-                matrixDescriptorWithRows:1 columns:dim rowBytes:dim*sizeof(float) dataType:MPSDataTypeFloat32];
+                matrixDescriptorWithRows:1 columns:dim rowBytes:dim*sizeof(uint16_t) dataType:MPSDataTypeFloat16];
             MPSMatrix *matFfnOut = [[MPSMatrix alloc] initWithBuffer:bufFfnOut descriptor:descFfnOut];
             MPSMatrixMultiplication *mmW2 = [[MPSMatrixMultiplication alloc]
                 initWithDevice:g_device transposeLeft:NO transposeRight:YES
