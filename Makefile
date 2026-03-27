@@ -96,6 +96,12 @@ test-cuda: voxtral_tts_kernels.o voxtral_tts_cuda.o test_kernels.o
 test_kernels.o: test_kernels.c voxtral_tts.h voxtral_tts_kernels.h voxtral_tts_cuda.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Test harness (Metal)
+test-metal: CFLAGS += $(METAL_CFLAGS)
+test-metal: LDFLAGS += $(METAL_LDFLAGS)
+test-metal: voxtral_tts_kernels.o voxtral_tts_metal.o test_kernels.o
+	$(CC) $(CFLAGS) -o test_kernels $^ $(LDFLAGS)
+
 # Test harness (CPU only)
 test-cpu: CFLAGS += -DUSE_BLAS
 test-cpu: voxtral_tts_kernels.o test_kernels_cpu.o

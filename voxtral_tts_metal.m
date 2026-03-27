@@ -282,7 +282,7 @@ static int init_shaders(void) {
     }
 
     /* Create pipeline states for each kernel */
-    struct { const char *name; id<MTLComputePipelineState> *pipeline; } kernels[] = {
+    struct { const char *name; id<MTLComputePipelineState> __strong *pipeline; } kernels[] = {
         {"rms_norm", &g_rms_norm_pipeline},
         {"silu", &g_silu_pipeline},
         {"silu_mul", &g_silu_mul_pipeline},
@@ -496,6 +496,84 @@ void tts_metal_sgemm(int M, int N, int K,
         [cmdBuffer waitUntilCompleted];
 
         memcpy(C, [bufC contents], (size_t)M * N * sizeof(float));
+    }
+}
+
+/* ========================================================================
+ * Standalone Kernel Wrappers (for test harness + individual dispatch)
+ * ======================================================================== */
+
+void tts_metal_rms_norm(float *out, const float *x, const float *weight,
+                        int seq_len, int hidden, float eps) {
+    @autoreleasepool {
+        id<MTLBuffer> bufX = [g_device newBufferWithBytes:x length:seq_len * hidden * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufW = [g_device newBufferWithBytes:weight length:hidden * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufOut = [g_device newBufferWithLength:seq_len * hidden * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setBuffer:bufX offset:0 atIndex:0];
+        [enc setBuffer:bufW offset:0 atIndex:1];
+        [enc setBuffer:bufOut offset:0 atIndex:2];
+        [enc setBytes:&hidden length:sizeof(int) atIndex:3];
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(seq_len, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(out, [bufOut contents], seq_len * hidden * sizeof(float));
+    }
+}
+
+void tts_metal_silu_mul(float *gate, const float *up, int n) {
+    @autoreleasepool {
+        id<MTLBuffer> bufGate = [g_device newBufferWithBytes:gate length:n * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufUp = [g_device newBufferWithBytes:up length:n * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:g_silu_mul_pipeline];
+        [enc setBuffer:bufGate offset:0 atIndex:0];
+        [enc setBuffer:bufUp offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(gate, [bufGate contents], n * sizeof(float));
+    }
+}
+
+void tts_metal_add_inplace(float *a, const float *b, int n) {
+    @autoreleasepool {
+        id<MTLBuffer> bufA = [g_device newBufferWithBytes:a length:n * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufB = [g_device newBufferWithBytes:b length:n * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:g_add_inplace_pipeline];
+        [enc setBuffer:bufA offset:0 atIndex:0];
+        [enc setBuffer:bufB offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(a, [bufA contents], n * sizeof(float));
     }
 }
 
