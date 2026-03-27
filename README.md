@@ -44,7 +44,10 @@ make cuda CUDA_ARCH=sm_89   # Ada Lovelace (RTX 4090)
 make cuda CUDA_ARCH=sm_90   # Hopper (H100)
 make cuda CUDA_ARCH=sm_100  # Blackwell (B200)
 
-# macOS with Accelerate
+# macOS with Metal GPU + Accelerate (Apple Silicon, recommended)
+make apple-gpu
+
+# macOS with Accelerate (CPU only)
 make apple
 
 # Portable (no BLAS, slower)
@@ -52,6 +55,8 @@ make noblas
 ```
 
 The CUDA build uploads all model weights to GPU VRAM and runs the full 26-layer LLM forward pass on GPU using cuBLAS for GEMM and custom CUDA kernels for RMS norm, RoPE, attention, and SwiGLU activation.
+
+The Metal build uses MPS (Metal Performance Shaders) for matrix multiplication with bf16->f16 weight caching, custom Metal compute kernels, and zero-copy shared memory for the KV cache. All 26 decoder layers are encoded into a single command buffer per token.
 
 ### Download Model
 

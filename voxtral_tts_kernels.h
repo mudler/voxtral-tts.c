@@ -173,9 +173,12 @@ void tts_embed_token_bf16(float *out, const uint16_t *embeddings_bf16,
 /* Global verbose flag */
 extern int tts_verbose;
 
-/* CUDA support (included here for dispatch convenience) */
+/* GPU backend support (included here for dispatch convenience) */
 #ifdef USE_CUDA
 #include "voxtral_tts_cuda.h"
+#endif
+#ifdef USE_METAL
+#include "voxtral_tts_metal.h"
 #endif
 
 #endif /* VOXTRAL_TTS_KERNELS_H */

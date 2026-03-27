@@ -13,6 +13,9 @@
  *   ./test_kernels
  */
 
+/* Define tts_verbose since we don't link voxtral_tts.o */
+int tts_verbose = 0;
+
 #include "voxtral_tts.h"
 #include "voxtral_tts_kernels.h"
 #include <stdio.h>
@@ -148,6 +151,12 @@ static void test_rms_norm(void) {
         compare_tensors("rms_norm(dim=3072)", cpu_out, gpu_out, dim, 1e-4f, 1e-6f);
 
         tts_cuda_free_ptr(d_x); tts_cuda_free_ptr(d_w); tts_cuda_free_ptr(d_out);
+    } else
+#endif
+#ifdef USE_METAL
+    if (tts_metal_available()) {
+        tts_metal_rms_norm(gpu_out, x, weight, 1, dim, TTS_DEC_NORM_EPS);
+        compare_tensors("rms_norm(dim=3072)", cpu_out, gpu_out, dim, 1e-4f, 1e-6f);
     } else
 #endif
     {
@@ -329,6 +338,15 @@ static void test_silu_mul(void) {
         tts_cuda_free_ptr(d_gate); tts_cuda_free_ptr(d_up);
     } else
 #endif
+#ifdef USE_METAL
+    if (tts_metal_available()) {
+        float *gate_m = malloc(n * sizeof(float));
+        memcpy(gate_m, gate, n * sizeof(float));
+        tts_metal_silu_mul(gate_m, up, n);
+        compare_tensors("silu_mul(n=9216)", gate_ref, gate_m, n, 1e-5f, 1e-7f);
+        free(gate_m);
+    } else
+#endif
     {
         float *gate2 = malloc(n * sizeof(float));
         memcpy(gate2, gate, n * sizeof(float));
@@ -372,6 +390,15 @@ static void test_add_inplace(void) {
         compare_tensors("add_inplace(n=3072)", a_ref, gpu_out, n, 0.0f, 0.0f);
 
         tts_cuda_free_ptr(d_a); tts_cuda_free_ptr(d_b);
+    } else
+#endif
+#ifdef USE_METAL
+    if (tts_metal_available()) {
+        float *a_m = malloc(n * sizeof(float));
+        memcpy(a_m, a, n * sizeof(float));
+        tts_metal_add_inplace(a_m, b, n);
+        compare_tensors("add_inplace(n=3072)", a_ref, a_m, n, 0.0f, 0.0f);
+        free(a_m);
     } else
 #endif
     {
@@ -419,6 +446,13 @@ static void test_gemm_bf16(void) {
         tts_cuda_free_ptr(d_W); tts_cuda_free_ptr(d_x); tts_cuda_free_ptr(d_y);
     } else
 #endif
+#ifdef USE_METAL
+    if (tts_metal_available()) {
+        tts_metal_sgemm_bf16(M, N, K, x, W_bf16, gpu_out);
+        compare_tensors("gemm_bf16(1x3072 @ 4096x3072)", cpu_out, gpu_out,
+                        M * N, 1e-2f, 1e-3f);
+    } else
+#endif
     {
         float *cpu_out2 = malloc(M * N * sizeof(float));
         tts_linear_nobias_bf16(cpu_out2, x, W_bf16, M, K, N);
@@ -445,8 +479,15 @@ int main(int argc, char *argv[]) {
     } else {
         printf("GPU init failed, running CPU-only tests\n");
     }
+#elif defined(USE_METAL)
+    printf("Metal: enabled\n");
+    if (tts_metal_init()) {
+        printf("GPU initialized successfully\n");
+    } else {
+        printf("GPU init failed, running CPU-only tests\n");
+    }
 #else
-    printf("CUDA: disabled (CPU-only tests)\n");
+    printf("GPU: disabled (CPU-only tests)\n");
 #endif
 
     printf("\n--- Element-wise Operations ---\n");
@@ -473,6 +514,8 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_CUDA
     tts_cuda_free();
+#elif defined(USE_METAL)
+    tts_metal_shutdown();
 #endif
 
     return failed_tests > 0 ? 1 : 0;
