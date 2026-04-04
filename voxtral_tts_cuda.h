@@ -17,12 +17,16 @@
  * GPU Context
  * ======================================================================== */
 
-/* Per-layer weight pointers on GPU (bf16) */
+/* Per-layer weight pointers on GPU (bf16 or int8+scale) */
 typedef struct {
-    void *wq, *wk, *wv, *wo;       /* attention weights (bf16) */
-    void *w1, *w2, *w3;            /* FFN weights (bf16) */
+    void *wq, *wk, *wv, *wo;       /* attention weights (bf16 or int8) */
+    void *w1, *w2, *w3;            /* FFN weights (bf16 or int8) */
     float *attention_norm;          /* f32 */
     float *ffn_norm;                /* f32 */
+
+    /* INT8 per-channel scales on GPU (NULL if bf16) */
+    float *wq_scale, *wk_scale, *wv_scale, *wo_scale;
+    float *w1_scale, *w2_scale, *w3_scale;
 } tts_cuda_layer_weights_t;
 
 typedef struct {
@@ -47,6 +51,17 @@ typedef struct {
     float *ac_norm_gpu;
     float *ac_time_inv_freq_gpu;
     tts_cuda_layer_weights_t ac_layers[3];
+
+    /* INT8 acoustic projection scales (NULL if bf16) */
+    float *ac_input_proj_scale_gpu;
+    float *ac_time_proj_scale_gpu;
+    float *ac_llm_proj_scale_gpu;
+    float *ac_semantic_out_scale_gpu;
+    float *ac_acoustic_out_scale_gpu;
+
+    /* Whether weights are INT8 quantized */
+    int llm_is_int8;
+    int ac_is_int8;
 
     /* KV cache on GPU */
     float *kv_cache_k_gpu;          /* [layers, max_seq, kv_dim] */
@@ -91,6 +106,10 @@ int tts_cuda_init(int kv_cache_max);
 /* Upload model weights from CPU (bf16 mmap'd) to GPU VRAM */
 int tts_cuda_upload_llm_weights(void *decoder_ptr);
 int tts_cuda_upload_acoustic_weights(void *acoustic_ptr);
+
+/* Upload INT8 quantized weights to GPU (auto-detected, half VRAM of bf16) */
+int tts_cuda_upload_llm_weights_int8(void *decoder_ptr);
+int tts_cuda_upload_acoustic_weights_int8(void *acoustic_ptr);
 
 /* Free all GPU resources */
 void tts_cuda_free(void);

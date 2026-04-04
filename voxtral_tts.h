@@ -111,6 +111,15 @@ typedef struct {
     uint16_t *w2_bf16;        /* [dim, hidden] = [3072, 9216] down */
     uint16_t *w3_bf16;        /* [hidden, dim] = [9216, 3072] up */
     float *ffn_norm;           /* [3072] */
+
+    /* INT8 quantized weight alternatives (per-channel scale) */
+    int8_t *wq_int8;  float *wq_scale;   /* [4096] */
+    int8_t *wk_int8;  float *wk_scale;   /* [1024] */
+    int8_t *wv_int8;  float *wv_scale;   /* [1024] */
+    int8_t *wo_int8;  float *wo_scale;   /* [3072] */
+    int8_t *w1_int8;  float *w1_scale;   /* [9216] */
+    int8_t *w2_int8;  float *w2_scale;   /* [3072] */
+    int8_t *w3_int8;  float *w3_scale;   /* [9216] */
 } tts_dec_layer_t;
 
 typedef struct {
@@ -122,6 +131,9 @@ typedef struct {
 
     /* Final norm */
     float *norm;               /* [3072] */
+
+    /* INT8 quantization flag (auto-detected at load time) */
+    int is_int8;
 } tts_decoder_t;
 
 /* ========================================================================
@@ -141,6 +153,15 @@ typedef struct {
     uint16_t *w2_bf16;        /* [3072, 9216] */
     uint16_t *w3_bf16;        /* [9216, 3072] */
     float *ffn_norm;           /* [3072] */
+
+    /* INT8 quantized weight alternatives (per-channel scale) */
+    int8_t *wq_int8;  float *wq_scale;
+    int8_t *wk_int8;  float *wk_scale;
+    int8_t *wv_int8;  float *wv_scale;
+    int8_t *wo_int8;  float *wo_scale;
+    int8_t *w1_int8;  float *w1_scale;
+    int8_t *w2_int8;  float *w2_scale;
+    int8_t *w3_int8;  float *w3_scale;
 } tts_ac_layer_t;
 
 typedef struct {
@@ -162,6 +183,16 @@ typedef struct {
 
     /* Transformer layers */
     tts_ac_layer_t layers[TTS_AC_LAYERS];
+
+    /* INT8 quantized projection alternatives */
+    int8_t *input_proj_int8;   float *input_proj_scale;
+    int8_t *time_proj_int8;    float *time_proj_scale;
+    int8_t *llm_proj_int8;     float *llm_proj_scale;
+    int8_t *semantic_out_int8; float *semantic_out_scale;
+    int8_t *acoustic_out_int8; float *acoustic_out_scale;
+
+    /* INT8 quantization flag (auto-detected at load time) */
+    int is_int8;
 } tts_acoustic_t;
 
 /* ========================================================================
@@ -328,6 +359,9 @@ void tts_free(tts_ctx_t *ctx);
 /* Load a voice embedding from .pt file or raw binary */
 tts_voice_t *tts_voice_load(const char *path);
 void tts_voice_free(tts_voice_t *voice);
+
+/* Reset KV cache for a new utterance (reuse loaded model) */
+void tts_reset(tts_ctx_t *ctx);
 
 /* Set random seed for reproducibility */
 void tts_set_seed(tts_ctx_t *ctx, uint64_t seed);

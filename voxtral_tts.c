@@ -6,6 +6,7 @@
 
 #include "voxtral_tts.h"
 #include "voxtral_tts_kernels.h"
+#include "voxtral_tts_cuda.h"
 #include "voxtral_tts_safetensors.h"
 #include "voxtral_tts_tokenizer.h"
 #include <stdio.h>
@@ -95,8 +96,13 @@ tts_ctx_t *tts_load(const char *model_dir) {
     fprintf(stderr, "Initializing CUDA...\n");
     if (tts_cuda_init(ctx->kv_cache_max) == 0) {
         fprintf(stderr, "Uploading weights to GPU...\n");
-        tts_cuda_upload_llm_weights(&ctx->decoder);
-        tts_cuda_upload_acoustic_weights(&ctx->acoustic);
+        if (ctx->decoder.is_int8) {
+            tts_cuda_upload_llm_weights_int8(&ctx->decoder);
+            tts_cuda_upload_acoustic_weights_int8(&ctx->acoustic);
+        } else {
+            tts_cuda_upload_llm_weights(&ctx->decoder);
+            tts_cuda_upload_acoustic_weights(&ctx->acoustic);
+        }
     } else {
         fprintf(stderr, "CUDA not available, using CPU\n");
     }
@@ -104,6 +110,23 @@ tts_ctx_t *tts_load(const char *model_dir) {
 
     fprintf(stderr, "Model loaded successfully.\n");
     return ctx;
+}
+
+void tts_reset(tts_ctx_t *ctx) {
+    if (!ctx) return;
+    ctx->kv_cache_len = 0;
+    /* Zero out KV cache on CPU */
+    int kv_dim = TTS_DEC_KV_HEADS * TTS_DEC_HEAD_DIM;
+    size_t kv_bytes = (size_t)TTS_DEC_LAYERS * ctx->kv_cache_max * kv_dim * sizeof(float);
+    if (ctx->kv_cache_k) memset(ctx->kv_cache_k, 0, kv_bytes);
+    if (ctx->kv_cache_v) memset(ctx->kv_cache_v, 0, kv_bytes);
+#ifdef USE_CUDA
+    /* Zero out KV cache on GPU */
+    if (tts_cuda_available()) {
+        tts_cuda_memset(g_cuda.kv_cache_k_gpu, 0, kv_bytes);
+        tts_cuda_memset(g_cuda.kv_cache_v_gpu, 0, kv_bytes);
+    }
+#endif
 }
 
 void tts_free(tts_ctx_t *ctx) {

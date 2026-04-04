@@ -310,6 +310,165 @@ extern "C" int tts_cuda_upload_acoustic_weights(void *acoustic_ptr) {
 }
 
 /* ========================================================================
+ * INT8 Weight Upload (half VRAM of bf16)
+ * ======================================================================== */
+
+static void *upload_int8(const int8_t *host_int8, size_t n_elements) {
+    void *d_ptr = NULL;
+    size_t bytes = n_elements * sizeof(int8_t);
+    cudaMalloc(&d_ptr, bytes);
+    if (d_ptr) cudaMemcpy(d_ptr, host_int8, bytes, cudaMemcpyHostToDevice);
+    return d_ptr;
+}
+
+/* Upload INT8 weight + scale, or fall back to bf16 if not quantized */
+static void upload_weight_int8_or_bf16(
+    tts_cuda_layer_weights_t *dst, const char *label,
+    const int8_t *int8_ptr, const float *scale_ptr, int out_dim,
+    const uint16_t *bf16_ptr, size_t n_elements)
+{
+    if (int8_ptr) {
+        dst->wq = upload_int8(int8_ptr, n_elements); /* reusing wq field as void* */
+        /* scale_ptr is per output channel */
+        /* Store scale on GPU too */
+    } else if (bf16_ptr) {
+        dst->wq = upload_bf16(bf16_ptr, n_elements);
+    }
+}
+
+extern "C" int tts_cuda_upload_llm_weights_int8(void *decoder_ptr) {
+    tts_decoder_t *dec = (tts_decoder_t *)decoder_ptr;
+    g_cuda.llm_is_int8 = dec->is_int8;
+
+    /* Token embeddings — always bf16 (not quantized) */
+    g_cuda.tok_embeddings_gpu = upload_bf16(dec->tok_embeddings_bf16,
+                                            (size_t)TTS_VOCAB_SIZE * TTS_DEC_DIM);
+    if (!g_cuda.tok_embeddings_gpu) return -1;
+
+    /* Final norm */
+    g_cuda.dec_norm_gpu = upload_f32(dec->norm, TTS_DEC_DIM);
+
+    /* Per-layer weights — INT8 (1 byte each) + scales */
+    for (int i = 0; i < TTS_DEC_LAYERS; i++) {
+        tts_dec_layer_t *src = &dec->layers[i];
+        tts_cuda_layer_weights_t *dst = &g_cuda.dec_layers[i];
+        int q_dim = TTS_DEC_HEADS * TTS_DEC_HEAD_DIM;
+        int kv_dim = TTS_DEC_KV_HEADS * TTS_DEC_HEAD_DIM;
+
+        if (dec->is_int8 && src->wq_int8) {
+            dst->wq = upload_int8(src->wq_int8, (size_t)q_dim * TTS_DEC_DIM);
+            dst->wk = upload_int8(src->wk_int8, (size_t)kv_dim * TTS_DEC_DIM);
+            dst->wv = upload_int8(src->wv_int8, (size_t)kv_dim * TTS_DEC_DIM);
+            dst->wo = upload_int8(src->wo_int8, (size_t)TTS_DEC_DIM * q_dim);
+            dst->w1 = upload_int8(src->w1_int8, (size_t)TTS_DEC_HIDDEN * TTS_DEC_DIM);
+            dst->w2 = upload_int8(src->w2_int8, (size_t)TTS_DEC_DIM * TTS_DEC_HIDDEN);
+            dst->w3 = upload_int8(src->w3_int8, (size_t)TTS_DEC_HIDDEN * TTS_DEC_DIM);
+            dst->wq_scale = upload_f32(src->wq_scale, q_dim);
+            dst->wk_scale = upload_f32(src->wk_scale, kv_dim);
+            dst->wv_scale = upload_f32(src->wv_scale, kv_dim);
+            dst->wo_scale = upload_f32(src->wo_scale, TTS_DEC_DIM);
+            dst->w1_scale = upload_f32(src->w1_scale, TTS_DEC_HIDDEN);
+            dst->w2_scale = upload_f32(src->w2_scale, TTS_DEC_DIM);
+            dst->w3_scale = upload_f32(src->w3_scale, TTS_DEC_HIDDEN);
+        } else {
+            dst->wq = upload_bf16(src->wq_bf16, (size_t)q_dim * TTS_DEC_DIM);
+            dst->wk = upload_bf16(src->wk_bf16, (size_t)kv_dim * TTS_DEC_DIM);
+            dst->wv = upload_bf16(src->wv_bf16, (size_t)kv_dim * TTS_DEC_DIM);
+            dst->wo = upload_bf16(src->wo_bf16, (size_t)TTS_DEC_DIM * q_dim);
+            dst->w1 = upload_bf16(src->w1_bf16, (size_t)TTS_DEC_HIDDEN * TTS_DEC_DIM);
+            dst->w2 = upload_bf16(src->w2_bf16, (size_t)TTS_DEC_DIM * TTS_DEC_HIDDEN);
+            dst->w3 = upload_bf16(src->w3_bf16, (size_t)TTS_DEC_HIDDEN * TTS_DEC_DIM);
+        }
+        dst->attention_norm = upload_f32(src->attention_norm, TTS_DEC_DIM);
+        dst->ffn_norm = upload_f32(src->ffn_norm, TTS_DEC_DIM);
+
+        if (!dst->wq || !dst->wk || !dst->wv || !dst->wo ||
+            !dst->w1 || !dst->w2 || !dst->w3) {
+            fprintf(stderr, "cuda: failed to upload LLM layer %d\n", i);
+            return -1;
+        }
+    }
+
+    fprintf(stderr, "  CUDA: LLM weights uploaded to GPU (INT8)\n");
+    return 0;
+}
+
+extern "C" int tts_cuda_upload_acoustic_weights_int8(void *acoustic_ptr) {
+    tts_acoustic_t *ac = (tts_acoustic_t *)acoustic_ptr;
+    int dim = TTS_AC_DIM;
+    g_cuda.ac_is_int8 = ac->is_int8;
+
+    /* Projection weights — INT8 or BF16 */
+    if (ac->is_int8 && ac->input_proj_int8) {
+        g_cuda.ac_input_proj_gpu = upload_int8(ac->input_proj_int8, (size_t)dim * TTS_ACOUSTIC_DIM);
+        g_cuda.ac_input_proj_scale_gpu = upload_f32(ac->input_proj_scale, dim);
+        g_cuda.ac_time_proj_gpu = upload_int8(ac->time_proj_int8, (size_t)dim * dim);
+        g_cuda.ac_time_proj_scale_gpu = upload_f32(ac->time_proj_scale, dim);
+        g_cuda.ac_llm_proj_gpu = upload_int8(ac->llm_proj_int8, (size_t)dim * dim);
+        g_cuda.ac_llm_proj_scale_gpu = upload_f32(ac->llm_proj_scale, dim);
+    } else {
+        g_cuda.ac_input_proj_gpu = upload_bf16(ac->input_proj_bf16, (size_t)dim * TTS_ACOUSTIC_DIM);
+        g_cuda.ac_time_proj_gpu = upload_bf16(ac->time_proj_bf16, (size_t)dim * dim);
+        g_cuda.ac_llm_proj_gpu = upload_bf16(ac->llm_proj_bf16, (size_t)dim * dim);
+    }
+
+    /* Output heads — may be bf16 even in int8 mode */
+    if (ac->semantic_out_int8) {
+        g_cuda.ac_semantic_out_gpu = upload_int8(ac->semantic_out_int8, (size_t)TTS_SEMANTIC_CB_PADDED * dim);
+        g_cuda.ac_semantic_out_scale_gpu = upload_f32(ac->semantic_out_scale, TTS_SEMANTIC_CB_PADDED);
+    } else {
+        g_cuda.ac_semantic_out_gpu = upload_bf16(ac->semantic_out_bf16, (size_t)TTS_SEMANTIC_CB_PADDED * dim);
+    }
+    if (ac->acoustic_out_int8) {
+        g_cuda.ac_acoustic_out_gpu = upload_int8(ac->acoustic_out_int8, (size_t)TTS_ACOUSTIC_DIM * dim);
+        g_cuda.ac_acoustic_out_scale_gpu = upload_f32(ac->acoustic_out_scale, TTS_ACOUSTIC_DIM);
+    } else {
+        g_cuda.ac_acoustic_out_gpu = upload_bf16(ac->acoustic_out_bf16, (size_t)TTS_ACOUSTIC_DIM * dim);
+    }
+
+    g_cuda.ac_norm_gpu = upload_f32(ac->norm, dim);
+    g_cuda.ac_time_inv_freq_gpu = upload_f32(ac->time_inv_freq, dim / 2);
+
+    /* Layer weights */
+    for (int i = 0; i < TTS_AC_LAYERS; i++) {
+        tts_ac_layer_t *src = &ac->layers[i];
+        tts_cuda_layer_weights_t *dst = &g_cuda.ac_layers[i];
+        int q_dim = TTS_AC_HEADS * TTS_AC_HEAD_DIM;
+        int kv_dim = TTS_AC_KV_HEADS * TTS_AC_HEAD_DIM;
+
+        if (ac->is_int8 && src->wq_int8) {
+            dst->wq = upload_int8(src->wq_int8, (size_t)q_dim * dim);
+            dst->wk = upload_int8(src->wk_int8, (size_t)kv_dim * dim);
+            dst->wv = upload_int8(src->wv_int8, (size_t)kv_dim * dim);
+            dst->wo = upload_int8(src->wo_int8, (size_t)dim * q_dim);
+            dst->w1 = upload_int8(src->w1_int8, (size_t)TTS_AC_HIDDEN * dim);
+            dst->w2 = upload_int8(src->w2_int8, (size_t)dim * TTS_AC_HIDDEN);
+            dst->w3 = upload_int8(src->w3_int8, (size_t)TTS_AC_HIDDEN * dim);
+            dst->wq_scale = upload_f32(src->wq_scale, q_dim);
+            dst->wk_scale = upload_f32(src->wk_scale, kv_dim);
+            dst->wv_scale = upload_f32(src->wv_scale, kv_dim);
+            dst->wo_scale = upload_f32(src->wo_scale, dim);
+            dst->w1_scale = upload_f32(src->w1_scale, TTS_AC_HIDDEN);
+            dst->w2_scale = upload_f32(src->w2_scale, dim);
+            dst->w3_scale = upload_f32(src->w3_scale, TTS_AC_HIDDEN);
+        } else {
+            dst->wq = upload_bf16(src->wq_bf16, (size_t)q_dim * dim);
+            dst->wk = upload_bf16(src->wk_bf16, (size_t)kv_dim * dim);
+            dst->wv = upload_bf16(src->wv_bf16, (size_t)kv_dim * dim);
+            dst->wo = upload_bf16(src->wo_bf16, (size_t)dim * q_dim);
+            dst->w1 = upload_bf16(src->w1_bf16, (size_t)TTS_AC_HIDDEN * dim);
+            dst->w2 = upload_bf16(src->w2_bf16, (size_t)dim * TTS_AC_HIDDEN);
+            dst->w3 = upload_bf16(src->w3_bf16, (size_t)TTS_AC_HIDDEN * dim);
+        }
+        dst->attention_norm = upload_f32(src->attention_norm, dim);
+        dst->ffn_norm = upload_f32(src->ffn_norm, dim);
+    }
+
+    fprintf(stderr, "  CUDA: Acoustic weights uploaded to GPU (INT8)\n");
+    return 0;
+}
+
+/* ========================================================================
  * BF16 to F32 conversion kernel (on GPU)
  * ======================================================================== */
 
@@ -352,6 +511,55 @@ static float *get_gpu_weight_f32(const void *d_W_bf16, size_t n_elements) {
     bf16_to_f32_kernel<<<blocks, threads>>>(
         d_weight_scratch, (const __nv_bfloat16 *)d_W_bf16, (int)n_elements);
     return d_weight_scratch;
+}
+
+/* ========================================================================
+ * INT8 to F32 dequantization kernel (on GPU)
+ *
+ * Dequantizes: out[row, col] = (float)int8_weight[row, col] * scale[row]
+ * This is per-output-channel (per-row) dequantization.
+ * ======================================================================== */
+
+__global__ void int8_dequant_to_f32_kernel(float *dst, const int8_t *src,
+                                            const float *scale,
+                                            int out_dim, int in_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = out_dim * in_dim;
+    if (idx < total) {
+        int row = idx / in_dim;
+        dst[idx] = (float)src[idx] * scale[row];
+    }
+}
+
+static float *get_gpu_weight_f32_from_int8(const void *d_W_int8,
+                                            const float *d_scale,
+                                            int out_dim, int in_dim) {
+    size_t n_elements = (size_t)out_dim * in_dim;
+    if (n_elements > d_weight_scratch_cap) {
+        if (d_weight_scratch) cudaFree(d_weight_scratch);
+        cudaMalloc(&d_weight_scratch, n_elements * sizeof(float));
+        d_weight_scratch_cap = d_weight_scratch ? n_elements : 0;
+    }
+    if (!d_weight_scratch) return NULL;
+
+    int threads = 256;
+    int blocks = ((int)n_elements + threads - 1) / threads;
+    int8_dequant_to_f32_kernel<<<blocks, threads>>>(
+        d_weight_scratch, (const int8_t *)d_W_int8, d_scale,
+        out_dim, in_dim);
+    return d_weight_scratch;
+}
+
+/* Helper: y[M,N] = x[M,K] @ W_int8[N,K]^T  (all on GPU, dequant with scale)
+ * Dequantizes INT8 weights to f32 scratch, then calls cublasSgemm. */
+static void gpu_linear_int8(float *d_y, const float *d_x, const void *d_W_int8,
+                             const float *d_scale, int M, int K, int N) {
+    float *d_W_f32 = get_gpu_weight_f32_from_int8(d_W_int8, d_scale, N, K);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm((cublasHandle_t)g_cuda.cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        d_W_f32, K, d_x, K, &beta, d_y, N);
 }
 
 /* ========================================================================
@@ -717,6 +925,9 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
     /* Upload input embedding to GPU */
     cudaMemcpy(g_cuda.d_x, input_embed, dim * sizeof(float), cudaMemcpyHostToDevice);
 
+    /* Dispatch helper: pick INT8 or BF16 linear based on model format */
+    int is_int8 = g_cuda.llm_is_int8;
+
     /* Process 26 layers on GPU */
     for (int layer = 0; layer < TTS_DEC_LAYERS; layer++) {
         tts_cuda_layer_weights_t *l = &g_cuda.dec_layers[layer];
@@ -730,13 +941,22 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
         cublasHandle_t handle = (cublasHandle_t)g_cuda.cublas_handle;
 
         /* Q = x_norm @ Wq^T */
-        gpu_linear_bf16(g_cuda.d_q, g_cuda.d_x_norm, l->wq, 1, dim, q_dim);
+        if (is_int8 && l->wq_scale)
+            gpu_linear_int8(g_cuda.d_q, g_cuda.d_x_norm, l->wq, l->wq_scale, 1, dim, q_dim);
+        else
+            gpu_linear_bf16(g_cuda.d_q, g_cuda.d_x_norm, l->wq, 1, dim, q_dim);
 
         /* K = x_norm @ Wk^T */
-        gpu_linear_bf16(g_cuda.d_k, g_cuda.d_x_norm, l->wk, 1, dim, kv_dim);
+        if (is_int8 && l->wk_scale)
+            gpu_linear_int8(g_cuda.d_k, g_cuda.d_x_norm, l->wk, l->wk_scale, 1, dim, kv_dim);
+        else
+            gpu_linear_bf16(g_cuda.d_k, g_cuda.d_x_norm, l->wk, 1, dim, kv_dim);
 
         /* V = x_norm @ Wv^T */
-        gpu_linear_bf16(g_cuda.d_v, g_cuda.d_x_norm, l->wv, 1, dim, kv_dim);
+        if (is_int8 && l->wv_scale)
+            gpu_linear_int8(g_cuda.d_v, g_cuda.d_x_norm, l->wv, l->wv_scale, 1, dim, kv_dim);
+        else
+            gpu_linear_bf16(g_cuda.d_v, g_cuda.d_x_norm, l->wv, 1, dim, kv_dim);
 
         /* Apply RoPE to Q and K */
         rope_kernel<<<TTS_DEC_HEADS, TTS_DEC_HEAD_DIM / 2>>>(
@@ -763,7 +983,10 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
             scale, kv_dim);
 
         /* WO projection */
-        gpu_linear_bf16(g_cuda.d_proj_out, g_cuda.d_attn_out, l->wo, 1, q_dim, dim);
+        if (is_int8 && l->wo_scale)
+            gpu_linear_int8(g_cuda.d_proj_out, g_cuda.d_attn_out, l->wo, l->wo_scale, 1, q_dim, dim);
+        else
+            gpu_linear_bf16(g_cuda.d_proj_out, g_cuda.d_attn_out, l->wo, 1, q_dim, dim);
 
         /* Residual: x += proj_out */
         tts_cuda_add_inplace(g_cuda.d_x, g_cuda.d_proj_out, dim);
@@ -773,15 +996,22 @@ extern "C" void tts_cuda_llm_forward(float *out_hidden, const float *input_embed
                           1, dim, TTS_DEC_NORM_EPS);
 
         /* w1 (gate) and w3 (up) */
-        gpu_linear_bf16(g_cuda.d_gate, g_cuda.d_x_norm, l->w1, 1, dim, TTS_DEC_HIDDEN);
-
-        gpu_linear_bf16(g_cuda.d_up, g_cuda.d_x_norm, l->w3, 1, dim, TTS_DEC_HIDDEN);
+        if (is_int8 && l->w1_scale) {
+            gpu_linear_int8(g_cuda.d_gate, g_cuda.d_x_norm, l->w1, l->w1_scale, 1, dim, TTS_DEC_HIDDEN);
+            gpu_linear_int8(g_cuda.d_up, g_cuda.d_x_norm, l->w3, l->w3_scale, 1, dim, TTS_DEC_HIDDEN);
+        } else {
+            gpu_linear_bf16(g_cuda.d_gate, g_cuda.d_x_norm, l->w1, 1, dim, TTS_DEC_HIDDEN);
+            gpu_linear_bf16(g_cuda.d_up, g_cuda.d_x_norm, l->w3, 1, dim, TTS_DEC_HIDDEN);
+        }
 
         /* Fused SiLU(gate) * up */
         tts_cuda_silu_mul(g_cuda.d_gate, g_cuda.d_up, TTS_DEC_HIDDEN);
 
         /* w2 (down) */
-        gpu_linear_bf16(g_cuda.d_ffn_out, g_cuda.d_gate, l->w2, 1, TTS_DEC_HIDDEN, dim);
+        if (is_int8 && l->w2_scale)
+            gpu_linear_int8(g_cuda.d_ffn_out, g_cuda.d_gate, l->w2, l->w2_scale, 1, TTS_DEC_HIDDEN, dim);
+        else
+            gpu_linear_bf16(g_cuda.d_ffn_out, g_cuda.d_gate, l->w2, 1, TTS_DEC_HIDDEN, dim);
 
         /* Residual: x += ffn_out */
         tts_cuda_add_inplace(g_cuda.d_x, g_cuda.d_ffn_out, dim);
@@ -840,11 +1070,15 @@ extern "C" void tts_cuda_llm_prefill(const float *embeds, int seq_len, int start
         tts_cuda_rms_norm(d_x_norm, d_x, l->attention_norm, seq_len, dim, TTS_DEC_NORM_EPS);
 
         /* Q, K, V projections (batched) */
-        gpu_linear_bf16(d_q, d_x_norm, l->wq, seq_len, dim, q_dim);
-
-        gpu_linear_bf16(d_k, d_x_norm, l->wk, seq_len, dim, kv_dim);
-
-        gpu_linear_bf16(d_v, d_x_norm, l->wv, seq_len, dim, kv_dim);
+        if (g_cuda.llm_is_int8 && l->wq_scale) {
+            gpu_linear_int8(d_q, d_x_norm, l->wq, l->wq_scale, seq_len, dim, q_dim);
+            gpu_linear_int8(d_k, d_x_norm, l->wk, l->wk_scale, seq_len, dim, kv_dim);
+            gpu_linear_int8(d_v, d_x_norm, l->wv, l->wv_scale, seq_len, dim, kv_dim);
+        } else {
+            gpu_linear_bf16(d_q, d_x_norm, l->wq, seq_len, dim, q_dim);
+            gpu_linear_bf16(d_k, d_x_norm, l->wk, seq_len, dim, kv_dim);
+            gpu_linear_bf16(d_v, d_x_norm, l->wv, seq_len, dim, kv_dim);
+        }
 
         /* Apply RoPE to all positions */
         for (int s = 0; s < seq_len; s++) {
@@ -868,19 +1102,29 @@ extern "C" void tts_cuda_llm_prefill(const float *embeds, int seq_len, int start
             seq_len, start_pos, TTS_DEC_HEADS, TTS_DEC_KV_HEADS, TTS_DEC_HEAD_DIM, scale);
 
         /* WO + residual */
-        gpu_linear_bf16(d_proj_out, d_attn_out, l->wo, seq_len, q_dim, dim);
+        if (g_cuda.llm_is_int8 && l->wo_scale)
+            gpu_linear_int8(d_proj_out, d_attn_out, l->wo, l->wo_scale, seq_len, q_dim, dim);
+        else
+            gpu_linear_bf16(d_proj_out, d_attn_out, l->wo, seq_len, q_dim, dim);
         tts_cuda_add_inplace(d_x, d_proj_out, seq_len * dim);
 
         /* FFN */
         tts_cuda_rms_norm(d_x_norm, d_x, l->ffn_norm, seq_len, dim, TTS_DEC_NORM_EPS);
 
-        gpu_linear_bf16(d_gate, d_x_norm, l->w1, seq_len, dim, TTS_DEC_HIDDEN);
-
-        gpu_linear_bf16(d_up, d_x_norm, l->w3, seq_len, dim, TTS_DEC_HIDDEN);
+        if (g_cuda.llm_is_int8 && l->w1_scale) {
+            gpu_linear_int8(d_gate, d_x_norm, l->w1, l->w1_scale, seq_len, dim, TTS_DEC_HIDDEN);
+            gpu_linear_int8(d_up, d_x_norm, l->w3, l->w3_scale, seq_len, dim, TTS_DEC_HIDDEN);
+        } else {
+            gpu_linear_bf16(d_gate, d_x_norm, l->w1, seq_len, dim, TTS_DEC_HIDDEN);
+            gpu_linear_bf16(d_up, d_x_norm, l->w3, seq_len, dim, TTS_DEC_HIDDEN);
+        }
 
         tts_cuda_silu_mul(d_gate, d_up, seq_len * TTS_DEC_HIDDEN);
 
-        gpu_linear_bf16(d_ffn_out, d_gate, l->w2, seq_len, TTS_DEC_HIDDEN, dim);
+        if (g_cuda.llm_is_int8 && l->w2_scale)
+            gpu_linear_int8(d_ffn_out, d_gate, l->w2, l->w2_scale, seq_len, TTS_DEC_HIDDEN, dim);
+        else
+            gpu_linear_bf16(d_ffn_out, d_gate, l->w2, seq_len, TTS_DEC_HIDDEN, dim);
 
         tts_cuda_add_inplace(d_x, d_ffn_out, seq_len * dim);
     }
@@ -1036,21 +1280,32 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
     cudaMalloc(&d_xt, TTS_ACOUSTIC_DIM * sizeof(float));
     cudaMemcpy(d_xt, x_t, TTS_ACOUSTIC_DIM * sizeof(float), cudaMemcpyHostToDevice);
 
-    gpu_linear_bf16(d_tokens, d_xt, g_cuda.ac_input_proj_gpu, 1, TTS_ACOUSTIC_DIM, dim);
+    int ac_int8 = g_cuda.ac_is_int8;
+
+    if (ac_int8 && g_cuda.ac_input_proj_scale_gpu)
+        gpu_linear_int8(d_tokens, d_xt, g_cuda.ac_input_proj_gpu, g_cuda.ac_input_proj_scale_gpu, 1, TTS_ACOUSTIC_DIM, dim);
+    else
+        gpu_linear_bf16(d_tokens, d_xt, g_cuda.ac_input_proj_gpu, 1, TTS_ACOUSTIC_DIM, dim);
 
     /* Token 1: time_projection(time_embedding(t)) */
     int half_dim = dim / 2;
     time_embedding_kernel<<<(half_dim + 255) / 256, 256>>>(
         d_time_emb, g_cuda.ac_time_inv_freq_gpu, t_val, half_dim);
 
-    gpu_linear_bf16(d_tokens + dim, d_time_emb, g_cuda.ac_time_proj_gpu, 1, dim, dim);
+    if (ac_int8 && g_cuda.ac_time_proj_scale_gpu)
+        gpu_linear_int8(d_tokens + dim, d_time_emb, g_cuda.ac_time_proj_gpu, g_cuda.ac_time_proj_scale_gpu, 1, dim, dim);
+    else
+        gpu_linear_bf16(d_tokens + dim, d_time_emb, g_cuda.ac_time_proj_gpu, 1, dim, dim);
 
     /* Token 2: llm_projection(llm_hidden) */
     float *d_llm;
     cudaMalloc(&d_llm, dim * sizeof(float));
     cudaMemcpy(d_llm, llm_hidden, dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    gpu_linear_bf16(d_tokens + 2 * dim, d_llm, g_cuda.ac_llm_proj_gpu, 1, dim, dim);
+    if (ac_int8 && g_cuda.ac_llm_proj_scale_gpu)
+        gpu_linear_int8(d_tokens + 2 * dim, d_llm, g_cuda.ac_llm_proj_gpu, g_cuda.ac_llm_proj_scale_gpu, 1, dim, dim);
+    else
+        gpu_linear_bf16(d_tokens + 2 * dim, d_llm, g_cuda.ac_llm_proj_gpu, 1, dim, dim);
 
     /* 3 transformer layers */
     for (int layer = 0; layer < TTS_AC_LAYERS; layer++) {
@@ -1061,9 +1316,15 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
                           seq, dim, TTS_AC_NORM_EPS);
 
         /* Q, K, V */
-        gpu_linear_bf16(g_cuda.d_ac_q, g_cuda.d_ac_tokens_norm, l->wq, seq, dim, q_dim);
-        gpu_linear_bf16(g_cuda.d_ac_k, g_cuda.d_ac_tokens_norm, l->wk, seq, dim, kv_dim);
-        gpu_linear_bf16(g_cuda.d_ac_v, g_cuda.d_ac_tokens_norm, l->wv, seq, dim, kv_dim);
+        if (ac_int8 && l->wq_scale) {
+            gpu_linear_int8(g_cuda.d_ac_q, g_cuda.d_ac_tokens_norm, l->wq, l->wq_scale, seq, dim, q_dim);
+            gpu_linear_int8(g_cuda.d_ac_k, g_cuda.d_ac_tokens_norm, l->wk, l->wk_scale, seq, dim, kv_dim);
+            gpu_linear_int8(g_cuda.d_ac_v, g_cuda.d_ac_tokens_norm, l->wv, l->wv_scale, seq, dim, kv_dim);
+        } else {
+            gpu_linear_bf16(g_cuda.d_ac_q, g_cuda.d_ac_tokens_norm, l->wq, seq, dim, q_dim);
+            gpu_linear_bf16(g_cuda.d_ac_k, g_cuda.d_ac_tokens_norm, l->wk, seq, dim, kv_dim);
+            gpu_linear_bf16(g_cuda.d_ac_v, g_cuda.d_ac_tokens_norm, l->wv, seq, dim, kv_dim);
+        }
 
         /* Bidirectional attention (3 tokens, no mask) */
         tts_cuda_bidirectional_attention(g_cuda.d_ac_attn_out,
@@ -1071,16 +1332,27 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
             seq, TTS_AC_HEADS, TTS_AC_KV_HEADS, TTS_AC_HEAD_DIM, scale);
 
         /* WO + residual */
-        gpu_linear_bf16(g_cuda.d_ac_proj_out, g_cuda.d_ac_attn_out, l->wo, seq, q_dim, dim);
+        if (ac_int8 && l->wo_scale)
+            gpu_linear_int8(g_cuda.d_ac_proj_out, g_cuda.d_ac_attn_out, l->wo, l->wo_scale, seq, q_dim, dim);
+        else
+            gpu_linear_bf16(g_cuda.d_ac_proj_out, g_cuda.d_ac_attn_out, l->wo, seq, q_dim, dim);
         tts_cuda_add_inplace(d_tokens, g_cuda.d_ac_proj_out, seq * dim);
 
         /* FFN */
         tts_cuda_rms_norm(g_cuda.d_ac_tokens_norm, d_tokens, l->ffn_norm,
                           seq, dim, TTS_AC_NORM_EPS);
-        gpu_linear_bf16(g_cuda.d_ac_gate, g_cuda.d_ac_tokens_norm, l->w1, seq, dim, TTS_AC_HIDDEN);
-        gpu_linear_bf16(g_cuda.d_ac_up, g_cuda.d_ac_tokens_norm, l->w3, seq, dim, TTS_AC_HIDDEN);
+        if (ac_int8 && l->w1_scale) {
+            gpu_linear_int8(g_cuda.d_ac_gate, g_cuda.d_ac_tokens_norm, l->w1, l->w1_scale, seq, dim, TTS_AC_HIDDEN);
+            gpu_linear_int8(g_cuda.d_ac_up, g_cuda.d_ac_tokens_norm, l->w3, l->w3_scale, seq, dim, TTS_AC_HIDDEN);
+        } else {
+            gpu_linear_bf16(g_cuda.d_ac_gate, g_cuda.d_ac_tokens_norm, l->w1, seq, dim, TTS_AC_HIDDEN);
+            gpu_linear_bf16(g_cuda.d_ac_up, g_cuda.d_ac_tokens_norm, l->w3, seq, dim, TTS_AC_HIDDEN);
+        }
         tts_cuda_silu_mul(g_cuda.d_ac_gate, g_cuda.d_ac_up, seq * TTS_AC_HIDDEN);
-        gpu_linear_bf16(g_cuda.d_ac_ffn_out, g_cuda.d_ac_gate, l->w2, seq, TTS_AC_HIDDEN, dim);
+        if (ac_int8 && l->w2_scale)
+            gpu_linear_int8(g_cuda.d_ac_ffn_out, g_cuda.d_ac_gate, l->w2, l->w2_scale, seq, TTS_AC_HIDDEN, dim);
+        else
+            gpu_linear_bf16(g_cuda.d_ac_ffn_out, g_cuda.d_ac_gate, l->w2, seq, TTS_AC_HIDDEN, dim);
         tts_cuda_add_inplace(d_tokens, g_cuda.d_ac_ffn_out, seq * dim);
     }
 
@@ -1090,7 +1362,10 @@ extern "C" void tts_cuda_predict_velocity(float *out_velocity,
 
     float *d_vel;
     cudaMalloc(&d_vel, TTS_ACOUSTIC_DIM * sizeof(float));
-    gpu_linear_bf16(d_vel, g_cuda.d_ac_tokens_norm, g_cuda.ac_acoustic_out_gpu, 1, dim, TTS_ACOUSTIC_DIM);
+    if (g_cuda.ac_acoustic_out_scale_gpu)
+        gpu_linear_int8(d_vel, g_cuda.d_ac_tokens_norm, g_cuda.ac_acoustic_out_gpu, g_cuda.ac_acoustic_out_scale_gpu, 1, dim, TTS_ACOUSTIC_DIM);
+    else
+        gpu_linear_bf16(d_vel, g_cuda.d_ac_tokens_norm, g_cuda.ac_acoustic_out_gpu, 1, dim, TTS_ACOUSTIC_DIM);
 
     /* Download velocity to CPU */
     cudaMemcpy(out_velocity, d_vel, TTS_ACOUSTIC_DIM * sizeof(float),

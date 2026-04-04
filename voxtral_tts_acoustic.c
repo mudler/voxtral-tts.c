@@ -37,9 +37,44 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+static int8_t *load_int8_direct(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "acoustic: int8 weight not found: %s\n", name);
+        return NULL;
+    }
+    return safetensors_get_int8_direct(sf, t);
+}
+
+static float *load_scale(safetensors_file_t *sf, const char *weight_name) {
+    char scale_name[512];
+    snprintf(scale_name, sizeof(scale_name), "%s_scale", weight_name);
+    const safetensor_t *t = safetensors_find(sf, scale_name);
+    if (!t) {
+        fprintf(stderr, "acoustic: scale not found: %s\n", scale_name);
+        return NULL;
+    }
+    return safetensors_get_f32(sf, t);
+}
+
+/* Check if acoustic model uses INT8 quantized weights */
+static int detect_int8_acoustic(safetensors_file_t *sf) {
+    const safetensor_t *t = safetensors_find(sf,
+        "acoustic_transformer.layers.0.attention.wq.weight");
+    if (t && safetensor_is_int8(t)) return 1;
+    return 0;
+}
+
 int tts_acoustic_load(tts_acoustic_t *ac, void *sf_ptr) {
     safetensors_file_t *sf = (safetensors_file_t *)sf_ptr;
     char name[512];
+
+    /* Auto-detect INT8 vs BF16 */
+    int use_int8 = detect_int8_acoustic(sf);
+    ac->is_int8 = use_int8;
+
+    if (tts_verbose)
+        fprintf(stderr, "  Acoustic weights: %s\n", use_int8 ? "INT8 quantized" : "BF16");
 
     /* Time embedding inverse frequencies
      * May not be in checkpoint (it's a precomputed buffer).
@@ -60,26 +95,60 @@ int tts_acoustic_load(tts_acoustic_t *ac, void *sf_ptr) {
     }
 
     /* Input projections */
-    ac->input_proj_bf16 = load_bf16_direct(sf, "acoustic_transformer.input_projection.weight");
-    ac->time_proj_bf16 = load_bf16_direct(sf, "acoustic_transformer.time_projection.weight");
-    ac->llm_proj_bf16 = load_bf16_direct(sf, "acoustic_transformer.llm_projection.weight");
+    if (use_int8) {
+        ac->input_proj_int8 = load_int8_direct(sf, "acoustic_transformer.input_projection.weight");
+        ac->input_proj_scale = load_scale(sf, "acoustic_transformer.input_projection.weight");
+        ac->time_proj_int8 = load_int8_direct(sf, "acoustic_transformer.time_projection.weight");
+        ac->time_proj_scale = load_scale(sf, "acoustic_transformer.time_projection.weight");
+        ac->llm_proj_int8 = load_int8_direct(sf, "acoustic_transformer.llm_projection.weight");
+        ac->llm_proj_scale = load_scale(sf, "acoustic_transformer.llm_projection.weight");
+        if (!ac->input_proj_int8 || !ac->input_proj_scale ||
+            !ac->time_proj_int8 || !ac->time_proj_scale ||
+            !ac->llm_proj_int8 || !ac->llm_proj_scale)
+            return -1;
+    } else {
+        ac->input_proj_bf16 = load_bf16_direct(sf, "acoustic_transformer.input_projection.weight");
+        ac->time_proj_bf16 = load_bf16_direct(sf, "acoustic_transformer.time_projection.weight");
+        ac->llm_proj_bf16 = load_bf16_direct(sf, "acoustic_transformer.llm_projection.weight");
+        if (!ac->input_proj_bf16 || !ac->time_proj_bf16 || !ac->llm_proj_bf16)
+            return -1;
+    }
 
-    if (!ac->input_proj_bf16 || !ac->time_proj_bf16 || !ac->llm_proj_bf16)
-        return -1;
+    /* Output heads — try INT8 first, fall back to BF16 (these may not be quantized) */
+    if (use_int8) {
+        ac->semantic_out_int8 = load_int8_direct(sf,
+            "acoustic_transformer.semantic_codebook_output.weight");
+        if (ac->semantic_out_int8) {
+            ac->semantic_out_scale = load_scale(sf,
+                "acoustic_transformer.semantic_codebook_output.weight");
+            if (!ac->semantic_out_scale) return -1;
+        }
+    }
+    if (!ac->semantic_out_int8) {
+        ac->semantic_out_bf16 = load_bf16_direct(sf,
+            "acoustic_transformer.semantic_codebook_output.weight");
+        if (!ac->semantic_out_bf16) return -1;
+    }
 
-    /* Output heads */
-    ac->semantic_out_bf16 = load_bf16_direct(sf,
-        "acoustic_transformer.semantic_codebook_output.weight");
-    if (!ac->semantic_out_bf16) return -1;
+    if (use_int8) {
+        ac->acoustic_out_int8 = load_int8_direct(sf,
+            "acoustic_transformer.acoustic_codebook_output.weight");
+        if (ac->acoustic_out_int8) {
+            ac->acoustic_out_scale = load_scale(sf,
+                "acoustic_transformer.acoustic_codebook_output.weight");
+            if (!ac->acoustic_out_scale) return -1;
+        }
+    }
+    if (!ac->acoustic_out_int8) {
+        ac->acoustic_out_bf16 = load_bf16_direct(sf,
+            "acoustic_transformer.acoustic_codebook_output.weight");
+        if (!ac->acoustic_out_bf16) return -1;
+    }
 
-    /* Check for bias */
+    /* Check for bias (always f32) */
     const safetensor_t *bias_t = safetensors_find(sf,
         "acoustic_transformer.semantic_codebook_output.bias");
     ac->semantic_out_bias = bias_t ? safetensors_get_f32(sf, bias_t) : NULL;
-
-    ac->acoustic_out_bf16 = load_bf16_direct(sf,
-        "acoustic_transformer.acoustic_codebook_output.weight");
-    if (!ac->acoustic_out_bf16) return -1;
 
     /* Final norm */
     ac->norm = load_f32(sf, "acoustic_transformer.norm.weight");
@@ -89,38 +158,76 @@ int tts_acoustic_load(tts_acoustic_t *ac, void *sf_ptr) {
     for (int i = 0; i < TTS_AC_LAYERS; i++) {
         tts_ac_layer_t *l = &ac->layers[i];
 
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wq.weight", i);
-        l->wq_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wk.weight", i);
-        l->wk_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wv.weight", i);
-        l->wv_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wo.weight", i);
-        l->wo_bf16 = load_bf16_direct(sf, name);
+        if (use_int8) {
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wq.weight", i);
+            l->wq_int8 = load_int8_direct(sf, name);
+            l->wq_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wk.weight", i);
+            l->wk_int8 = load_int8_direct(sf, name);
+            l->wk_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wv.weight", i);
+            l->wv_int8 = load_int8_direct(sf, name);
+            l->wv_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wo.weight", i);
+            l->wo_int8 = load_int8_direct(sf, name);
+            l->wo_scale = load_scale(sf, name);
 
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w1.weight", i);
+            l->w1_int8 = load_int8_direct(sf, name);
+            l->w1_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w2.weight", i);
+            l->w2_int8 = load_int8_direct(sf, name);
+            l->w2_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w3.weight", i);
+            l->w3_int8 = load_int8_direct(sf, name);
+            l->w3_scale = load_scale(sf, name);
+
+            if (!l->wq_int8 || !l->wq_scale || !l->wk_int8 || !l->wk_scale ||
+                !l->wv_int8 || !l->wv_scale || !l->wo_int8 || !l->wo_scale ||
+                !l->w1_int8 || !l->w1_scale || !l->w2_int8 || !l->w2_scale ||
+                !l->w3_int8 || !l->w3_scale) {
+                fprintf(stderr, "acoustic: failed to load INT8 layer %d\n", i);
+                return -1;
+            }
+        } else {
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wq.weight", i);
+            l->wq_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wk.weight", i);
+            l->wk_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wv.weight", i);
+            l->wv_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention.wo.weight", i);
+            l->wo_bf16 = load_bf16_direct(sf, name);
+
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w1.weight", i);
+            l->w1_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w2.weight", i);
+            l->w2_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w3.weight", i);
+            l->w3_bf16 = load_bf16_direct(sf, name);
+
+            if (!l->wq_bf16 || !l->wk_bf16 || !l->wv_bf16 || !l->wo_bf16 ||
+                !l->w1_bf16 || !l->w2_bf16 || !l->w3_bf16) {
+                fprintf(stderr, "acoustic: failed to load BF16 layer %d\n", i);
+                return -1;
+            }
+        }
+
+        /* Norms (always f32) */
         snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.attention_norm.weight", i);
         l->attention_norm = load_f32(sf, name);
-
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w1.weight", i);
-        l->w1_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w2.weight", i);
-        l->w2_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.feed_forward.w3.weight", i);
-        l->w3_bf16 = load_bf16_direct(sf, name);
-
         snprintf(name, sizeof(name), "acoustic_transformer.layers.%d.ffn_norm.weight", i);
         l->ffn_norm = load_f32(sf, name);
 
-        if (!l->wq_bf16 || !l->wk_bf16 || !l->wv_bf16 || !l->wo_bf16 ||
-            !l->attention_norm || !l->w1_bf16 || !l->w2_bf16 || !l->w3_bf16 ||
-            !l->ffn_norm) {
-            fprintf(stderr, "acoustic: failed to load layer %d\n", i);
+        if (!l->attention_norm || !l->ffn_norm) {
+            fprintf(stderr, "acoustic: failed to load norms for layer %d\n", i);
             return -1;
         }
     }
 
     if (tts_verbose)
-        fprintf(stderr, "  Acoustic transformer loaded (%d layers)\n", TTS_AC_LAYERS);
+        fprintf(stderr, "  Acoustic transformer loaded (%d layers, %s)\n",
+                TTS_AC_LAYERS, use_int8 ? "INT8" : "BF16");
 
     return 0;
 }
@@ -195,21 +302,38 @@ static void predict_velocity(tts_ctx_t *ctx, const float *x_t,
     int kv_dim = TTS_AC_KV_HEADS * TTS_AC_HEAD_DIM;
     float scale = 1.0f / sqrtf((float)TTS_AC_HEAD_DIM);
 
+    int is_int8 = ac->is_int8;
+
     /* Build 3 tokens: [input_proj(x_t), time_proj(time_emb(t)), llm_proj(h)] */
     float *tokens = ctx->ac_tokens;
 
     /* Token 0: input_projection(x_t) — [36] -> [3072] */
-    tts_linear_nobias_bf16(tokens + 0 * dim, x_t, ac->input_proj_bf16,
-                           1, TTS_ACOUSTIC_DIM, dim);
+    if (is_int8) {
+        tts_linear_nobias_int8(tokens + 0 * dim, x_t, ac->input_proj_int8,
+                               ac->input_proj_scale, 1, TTS_ACOUSTIC_DIM, dim);
+    } else {
+        tts_linear_nobias_bf16(tokens + 0 * dim, x_t, ac->input_proj_bf16,
+                               1, TTS_ACOUSTIC_DIM, dim);
+    }
 
     /* Token 1: time_projection(time_embedding(t)) */
     compute_time_embedding(ac, t_val, ctx->ac_time_emb, dim);
-    tts_linear_nobias_bf16(tokens + 1 * dim, ctx->ac_time_emb, ac->time_proj_bf16,
-                           1, dim, dim);
+    if (is_int8) {
+        tts_linear_nobias_int8(tokens + 1 * dim, ctx->ac_time_emb, ac->time_proj_int8,
+                               ac->time_proj_scale, 1, dim, dim);
+    } else {
+        tts_linear_nobias_bf16(tokens + 1 * dim, ctx->ac_time_emb, ac->time_proj_bf16,
+                               1, dim, dim);
+    }
 
     /* Token 2: llm_projection(llm_hidden) */
-    tts_linear_nobias_bf16(tokens + 2 * dim, llm_hidden, ac->llm_proj_bf16,
-                           1, dim, dim);
+    if (is_int8) {
+        tts_linear_nobias_int8(tokens + 2 * dim, llm_hidden, ac->llm_proj_int8,
+                               ac->llm_proj_scale, 1, dim, dim);
+    } else {
+        tts_linear_nobias_bf16(tokens + 2 * dim, llm_hidden, ac->llm_proj_bf16,
+                               1, dim, dim);
+    }
 
     /* Forward through 3 bidirectional transformer layers */
     for (int layer = 0; layer < TTS_AC_LAYERS; layer++) {
@@ -220,12 +344,21 @@ static void predict_velocity(tts_ctx_t *ctx, const float *x_t,
                      seq, dim, TTS_AC_NORM_EPS);
 
         /* Q, K, V */
-        tts_linear_nobias_bf16(ctx->ac_q, ctx->ac_tokens_norm, l->wq_bf16,
-                               seq, dim, q_dim);
-        tts_linear_nobias_bf16(ctx->ac_k, ctx->ac_tokens_norm, l->wk_bf16,
-                               seq, dim, kv_dim);
-        tts_linear_nobias_bf16(ctx->ac_v, ctx->ac_tokens_norm, l->wv_bf16,
-                               seq, dim, kv_dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->ac_q, ctx->ac_tokens_norm, l->wq_int8,
+                                   l->wq_scale, seq, dim, q_dim);
+            tts_linear_nobias_int8(ctx->ac_k, ctx->ac_tokens_norm, l->wk_int8,
+                                   l->wk_scale, seq, dim, kv_dim);
+            tts_linear_nobias_int8(ctx->ac_v, ctx->ac_tokens_norm, l->wv_int8,
+                                   l->wv_scale, seq, dim, kv_dim);
+        } else {
+            tts_linear_nobias_bf16(ctx->ac_q, ctx->ac_tokens_norm, l->wq_bf16,
+                                   seq, dim, q_dim);
+            tts_linear_nobias_bf16(ctx->ac_k, ctx->ac_tokens_norm, l->wk_bf16,
+                                   seq, dim, kv_dim);
+            tts_linear_nobias_bf16(ctx->ac_v, ctx->ac_tokens_norm, l->wv_bf16,
+                                   seq, dim, kv_dim);
+        }
 
         /* Bidirectional attention (no causal mask, no positional encoding) */
         tts_bidirectional_attention(ctx->ac_attn_out, ctx->ac_q, ctx->ac_k,
@@ -234,21 +367,38 @@ static void predict_velocity(tts_ctx_t *ctx, const float *x_t,
                                     TTS_AC_HEAD_DIM, scale);
 
         /* Output projection + residual */
-        tts_linear_nobias_bf16(ctx->ac_proj_out, ctx->ac_attn_out, l->wo_bf16,
-                               seq, q_dim, dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->ac_proj_out, ctx->ac_attn_out, l->wo_int8,
+                                   l->wo_scale, seq, q_dim, dim);
+        } else {
+            tts_linear_nobias_bf16(ctx->ac_proj_out, ctx->ac_attn_out, l->wo_bf16,
+                                   seq, q_dim, dim);
+        }
         tts_add_inplace(tokens, ctx->ac_proj_out, seq * dim);
 
         /* FFN: RMSNorm -> SwiGLU */
         tts_rms_norm(ctx->ac_tokens_norm, tokens, l->ffn_norm,
                      seq, dim, TTS_AC_NORM_EPS);
-        tts_linear_nobias_bf16(ctx->ac_gate, ctx->ac_tokens_norm, l->w1_bf16,
-                               seq, dim, TTS_AC_HIDDEN);
-        tts_linear_nobias_bf16(ctx->ac_up, ctx->ac_tokens_norm, l->w3_bf16,
-                               seq, dim, TTS_AC_HIDDEN);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->ac_gate, ctx->ac_tokens_norm, l->w1_int8,
+                                   l->w1_scale, seq, dim, TTS_AC_HIDDEN);
+            tts_linear_nobias_int8(ctx->ac_up, ctx->ac_tokens_norm, l->w3_int8,
+                                   l->w3_scale, seq, dim, TTS_AC_HIDDEN);
+        } else {
+            tts_linear_nobias_bf16(ctx->ac_gate, ctx->ac_tokens_norm, l->w1_bf16,
+                                   seq, dim, TTS_AC_HIDDEN);
+            tts_linear_nobias_bf16(ctx->ac_up, ctx->ac_tokens_norm, l->w3_bf16,
+                                   seq, dim, TTS_AC_HIDDEN);
+        }
         tts_silu(ctx->ac_gate, seq * TTS_AC_HIDDEN);
         tts_mul_inplace(ctx->ac_gate, ctx->ac_up, seq * TTS_AC_HIDDEN);
-        tts_linear_nobias_bf16(ctx->ac_ffn_out, ctx->ac_gate, l->w2_bf16,
-                               seq, TTS_AC_HIDDEN, dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->ac_ffn_out, ctx->ac_gate, l->w2_int8,
+                                   l->w2_scale, seq, TTS_AC_HIDDEN, dim);
+        } else {
+            tts_linear_nobias_bf16(ctx->ac_ffn_out, ctx->ac_gate, l->w2_bf16,
+                                   seq, TTS_AC_HIDDEN, dim);
+        }
         tts_add_inplace(tokens, ctx->ac_ffn_out, seq * dim);
     }
 
@@ -257,8 +407,13 @@ static void predict_velocity(tts_ctx_t *ctx, const float *x_t,
     tts_rms_norm(normed, tokens, ac->norm, 1, dim, TTS_AC_NORM_EPS);
 
     /* Predict velocity: acoustic_codebook_output(normed) -> [36] */
-    tts_linear_nobias_bf16(out_velocity, normed, ac->acoustic_out_bf16,
-                           1, dim, TTS_ACOUSTIC_DIM);
+    if (ac->acoustic_out_int8) {
+        tts_linear_nobias_int8(out_velocity, normed, ac->acoustic_out_int8,
+                               ac->acoustic_out_scale, 1, dim, TTS_ACOUSTIC_DIM);
+    } else {
+        tts_linear_nobias_bf16(out_velocity, normed, ac->acoustic_out_bf16,
+                               1, dim, TTS_ACOUSTIC_DIM);
+    }
 }
 
 /* ========================================================================
@@ -284,8 +439,14 @@ void tts_acoustic_forward(tts_ctx_t *ctx, const float *llm_hidden,
     float *semantic_logits = (float *)malloc(TTS_SEMANTIC_CB_PADDED * sizeof(float));
     if (!semantic_logits) return;
 
-    tts_linear_bf16(semantic_logits, llm_hidden, ac->semantic_out_bf16,
-                    ac->semantic_out_bias, 1, dim, TTS_SEMANTIC_CB_PADDED);
+    if (ac->semantic_out_int8) {
+        tts_linear_int8(semantic_logits, llm_hidden, ac->semantic_out_int8,
+                        ac->semantic_out_scale, ac->semantic_out_bias,
+                        1, dim, TTS_SEMANTIC_CB_PADDED);
+    } else {
+        tts_linear_bf16(semantic_logits, llm_hidden, ac->semantic_out_bf16,
+                        ac->semantic_out_bias, 1, dim, TTS_SEMANTIC_CB_PADDED);
+    }
 
     /* Mask invalid tokens */
     semantic_logits[TTS_AUDIO_SPECIAL_EMPTY] = -1e30f; /* empty not allowed */

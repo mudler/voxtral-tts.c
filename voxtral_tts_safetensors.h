@@ -26,6 +26,7 @@ typedef enum {
     DTYPE_I32 = 3,
     DTYPE_I64 = 4,
     DTYPE_BOOL = 5,
+    DTYPE_I8 = 6,
     DTYPE_UNKNOWN = -1
 } safetensor_dtype_t;
 
@@ -69,6 +70,13 @@ float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 /* Get direct pointer to bf16 data in mmap'd region (no copy, caller must NOT free)
  * Only works for BF16 tensors. Returns NULL for other dtypes. */
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t);
+
+/* Get direct pointer to int8 data in mmap'd region (no copy, caller must NOT free)
+ * Only works for I8 tensors. Returns NULL for other dtypes. */
+int8_t *safetensors_get_int8_direct(const safetensors_file_t *sf, const safetensor_t *t);
+
+/* Check if tensor is stored in int8 format */
+int safetensor_is_int8(const safetensor_t *t);
 
 /* Check if tensor is stored in bf16 format */
 int safetensor_is_bf16(const safetensor_t *t);

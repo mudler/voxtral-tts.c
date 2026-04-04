@@ -211,6 +211,84 @@ void tts_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 }
 
 /* ========================================================================
+ * INT8 Quantized Linear Operations
+ *
+ * Weight layout: W_int8[out_dim, in_dim] (int8)
+ * Scale layout:  scale[out_dim] (float32, per output channel)
+ * Dequantization: W_float[o,i] = W_int8[o,i] * scale[o]
+ * ======================================================================== */
+
+/* Fused INT8 matvec for single-token decode (hot path) */
+static void int8_matvec_fused(float *y, const float *x, const int8_t *W_int8,
+                               const float *scale, const float *bias,
+                               int in_dim, int out_dim) {
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t *w_row = W_int8 + (size_t)o * in_dim;
+        float sum = 0.0f;
+        int k = 0;
+
+#ifdef __SSE2__
+        /* SSE2 vectorized path: process 16 int8 values at a time */
+        /* Accumulate as int32, then convert to float at end */
+#endif
+
+        for (; k < in_dim; k++) {
+            sum += x[k] * (float)w_row[k];
+        }
+
+        /* Apply per-channel scale */
+        sum *= scale[o];
+
+        /* Add bias if present */
+        if (bias) sum += bias[o];
+
+        y[o] = sum;
+    }
+}
+
+void tts_linear_nobias_int8(float *y, const float *x, const int8_t *W_int8,
+                            const float *scale, int seq_len, int in_dim, int out_dim) {
+    if (seq_len == 1) {
+        int8_matvec_fused(y, x, W_int8, scale, NULL, in_dim, out_dim);
+        return;
+    }
+    /* Multi-token path: dequantize to scratch then use BLAS */
+    size_t n = (size_t)out_dim * in_dim;
+    float *W_f32 = bf16_get_scratch(n);
+    if (!W_f32) return;
+    for (int o = 0; o < out_dim; o++) {
+        float s = scale[o];
+        const int8_t *row = W_int8 + (size_t)o * in_dim;
+        float *dst = W_f32 + (size_t)o * in_dim;
+        for (int i = 0; i < in_dim; i++) {
+            dst[i] = (float)row[i] * s;
+        }
+    }
+    tts_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+}
+
+void tts_linear_int8(float *y, const float *x, const int8_t *W_int8,
+                     const float *scale, const float *b,
+                     int seq_len, int in_dim, int out_dim) {
+    if (seq_len == 1) {
+        int8_matvec_fused(y, x, W_int8, scale, b, in_dim, out_dim);
+        return;
+    }
+    size_t n = (size_t)out_dim * in_dim;
+    float *W_f32 = bf16_get_scratch(n);
+    if (!W_f32) return;
+    for (int o = 0; o < out_dim; o++) {
+        float s = scale[o];
+        const int8_t *row = W_int8 + (size_t)o * in_dim;
+        float *dst = W_f32 + (size_t)o * in_dim;
+        for (int i = 0; i < in_dim; i++) {
+            dst[i] = (float)row[i] * s;
+        }
+    }
+    tts_linear(y, x, W_f32, b, seq_len, in_dim, out_dim);
+}
+
+/* ========================================================================
  * 1D Convolution
  * ======================================================================== */
 

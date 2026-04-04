@@ -45,6 +45,15 @@ void tts_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void tts_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
                      const float *b, int seq_len, int in_dim, int out_dim);
 
+/* Linear with int8 quantized weights + per-channel f32 scale (no bias) */
+void tts_linear_nobias_int8(float *y, const float *x, const int8_t *W_int8,
+                            const float *scale, int seq_len, int in_dim, int out_dim);
+
+/* Linear with int8 quantized weights + per-channel f32 scale + bias */
+void tts_linear_int8(float *y, const float *x, const int8_t *W_int8,
+                     const float *scale, const float *b,
+                     int seq_len, int in_dim, int out_dim);
+
 /* ========================================================================
  * 1D Convolution
  * ======================================================================== */
