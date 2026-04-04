@@ -18,6 +18,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -v <voice>      Voice name (default: neutral_female)\n");
     fprintf(stderr, "  -o <file>       Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -s <seed>       Random seed for reproducibility\n");
+    fprintf(stderr, "  --batch         Batch mode: read lines from stdin (output_path\\ttext)\n");
     fprintf(stderr, "  --verbose       Enable verbose output\n");
     fprintf(stderr, "  --list-voices   List available voices\n");
     fprintf(stderr, "  --inspect       Print model tensor info and exit\n");
@@ -38,6 +39,7 @@ int main(int argc, char *argv[]) {
     uint64_t seed = 0;
     int verbose = 0;
     int inspect = 0;
+    int batch_mode = 0;
     int max_frames = 2000;
 
     /* Parse arguments */
@@ -56,6 +58,8 @@ int main(int argc, char *argv[]) {
             verbose++;
         } else if (strcmp(argv[i], "--inspect") == 0) {
             inspect = 1;
+        } else if (strcmp(argv[i], "--batch") == 0) {
+            batch_mode = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -91,23 +95,87 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (!text) {
-        fprintf(stderr, "Error: no text to speak\n\n");
+    if (!batch_mode && !text) {
+        fprintf(stderr, "Error: no text to speak (use --batch for stdin mode)\n\n");
         usage(argv[0]);
         return 1;
     }
 
-    /* Load model */
+    /* Load model (once for both single and batch mode) */
     tts_ctx_t *ctx = tts_load(model_dir);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
 
-    /* Set seed if specified */
     if (seed > 0) tts_set_seed(ctx, seed);
 
-    /* Generate speech */
+    if (batch_mode) {
+        /* Batch mode: read "output_path\ttext" lines from stdin.
+         * Model stays loaded across all lines — no reload overhead.
+         * Prints "OK output_path" or "ERR output_path" per line to stdout. */
+        char line[65536];
+        int count = 0, ok = 0, fail = 0;
+
+        while (fgets(line, sizeof(line), stdin)) {
+            /* Strip trailing newline */
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                line[--len] = '\0';
+            if (len == 0) continue;
+
+            /* Parse: output_path\ttext */
+            char *tab = strchr(line, '\t');
+            if (!tab) {
+                fprintf(stderr, "batch: skipping malformed line (no tab): %.40s...\n", line);
+                continue;
+            }
+            *tab = '\0';
+            char *out_path = line;
+            char *gen_text = tab + 1;
+            count++;
+
+            /* Reset KV cache for each utterance */
+            tts_reset(ctx);
+
+            float *samples = NULL;
+            int n_samples = 0;
+
+            fprintf(stderr, "[%d] Generating: %.60s%s\n", count, gen_text,
+                    strlen(gen_text) > 60 ? "..." : "");
+
+            int ret = tts_generate(ctx, gen_text, voice, &samples, &n_samples);
+            if (ret != 0 || !samples || n_samples == 0) {
+                fprintf(stderr, "[%d] FAILED\n", count);
+                printf("ERR\t%s\n", out_path);
+                fflush(stdout);
+                fail++;
+                continue;
+            }
+
+            if (tts_write_wav(out_path, samples, n_samples, TTS_SAMPLE_RATE) != 0) {
+                fprintf(stderr, "[%d] Failed to write %s\n", count, out_path);
+                printf("ERR\t%s\n", out_path);
+                fflush(stdout);
+                free(samples);
+                fail++;
+                continue;
+            }
+
+            float duration = (float)n_samples / (float)TTS_SAMPLE_RATE;
+            fprintf(stderr, "[%d] OK: %s (%.2fs)\n", count, out_path, duration);
+            printf("OK\t%s\t%.2f\n", out_path, duration);
+            fflush(stdout);
+            free(samples);
+            ok++;
+        }
+
+        fprintf(stderr, "Batch done: %d/%d succeeded, %d failed\n", ok, count, fail);
+        tts_free(ctx);
+        return (fail > 0) ? 1 : 0;
+    }
+
+    /* Single-shot mode */
     float *samples = NULL;
     int n_samples = 0;
 
@@ -121,7 +189,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Write WAV */
     if (tts_write_wav(output, samples, n_samples, TTS_SAMPLE_RATE) != 0) {
         fprintf(stderr, "Failed to write %s\n", output);
         free(samples);

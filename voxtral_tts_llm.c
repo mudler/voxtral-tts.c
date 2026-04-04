@@ -42,11 +42,45 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+static int8_t *load_int8_direct(safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t) {
+        fprintf(stderr, "llm: int8 weight not found: %s\n", name);
+        return NULL;
+    }
+    return safetensors_get_int8_direct(sf, t);
+}
+
+static float *load_scale(safetensors_file_t *sf, const char *weight_name) {
+    char scale_name[512];
+    snprintf(scale_name, sizeof(scale_name), "%s_scale", weight_name);
+    const safetensor_t *t = safetensors_find(sf, scale_name);
+    if (!t) {
+        fprintf(stderr, "llm: scale not found: %s\n", scale_name);
+        return NULL;
+    }
+    return safetensors_get_f32(sf, t);
+}
+
+/* Check if the model uses INT8 quantized weights */
+static int detect_int8(safetensors_file_t *sf) {
+    const safetensor_t *t = safetensors_find(sf, "layers.0.attention.wq.weight");
+    if (t && safetensor_is_int8(t)) return 1;
+    return 0;
+}
+
 int tts_llm_load(tts_decoder_t *dec, void *sf_ptr) {
     safetensors_file_t *sf = (safetensors_file_t *)sf_ptr;
     char name[512];
 
-    /* Token embeddings (tied with output projection) */
+    /* Auto-detect INT8 vs BF16 */
+    int use_int8 = detect_int8(sf);
+    dec->is_int8 = use_int8;
+
+    if (tts_verbose)
+        fprintf(stderr, "  LLM weights: %s\n", use_int8 ? "INT8 quantized" : "BF16");
+
+    /* Token embeddings (always bf16, not quantized) */
     dec->tok_embeddings_bf16 = load_bf16_direct(sf,
         "mm_audio_embeddings.tok_embeddings.weight");
     if (!dec->tok_embeddings_bf16) return -1;
@@ -55,35 +89,71 @@ int tts_llm_load(tts_decoder_t *dec, void *sf_ptr) {
     for (int i = 0; i < TTS_DEC_LAYERS; i++) {
         tts_dec_layer_t *l = &dec->layers[i];
 
-        /* Attention weights (bf16 mmap) */
-        snprintf(name, sizeof(name), "layers.%d.attention.wq.weight", i);
-        l->wq_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "layers.%d.attention.wk.weight", i);
-        l->wk_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "layers.%d.attention.wv.weight", i);
-        l->wv_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "layers.%d.attention.wo.weight", i);
-        l->wo_bf16 = load_bf16_direct(sf, name);
+        if (use_int8) {
+            /* Load INT8 weights + scales */
+            snprintf(name, sizeof(name), "layers.%d.attention.wq.weight", i);
+            l->wq_int8 = load_int8_direct(sf, name);
+            l->wq_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.attention.wk.weight", i);
+            l->wk_int8 = load_int8_direct(sf, name);
+            l->wk_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.attention.wv.weight", i);
+            l->wv_int8 = load_int8_direct(sf, name);
+            l->wv_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.attention.wo.weight", i);
+            l->wo_int8 = load_int8_direct(sf, name);
+            l->wo_scale = load_scale(sf, name);
 
-        /* Norms (f32) */
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w1.weight", i);
+            l->w1_int8 = load_int8_direct(sf, name);
+            l->w1_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w2.weight", i);
+            l->w2_int8 = load_int8_direct(sf, name);
+            l->w2_scale = load_scale(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w3.weight", i);
+            l->w3_int8 = load_int8_direct(sf, name);
+            l->w3_scale = load_scale(sf, name);
+
+            if (!l->wq_int8 || !l->wq_scale || !l->wk_int8 || !l->wk_scale ||
+                !l->wv_int8 || !l->wv_scale || !l->wo_int8 || !l->wo_scale ||
+                !l->w1_int8 || !l->w1_scale || !l->w2_int8 || !l->w2_scale ||
+                !l->w3_int8 || !l->w3_scale) {
+                fprintf(stderr, "llm: failed to load INT8 layer %d\n", i);
+                return -1;
+            }
+        } else {
+            /* Load BF16 weights (original path) */
+            snprintf(name, sizeof(name), "layers.%d.attention.wq.weight", i);
+            l->wq_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.attention.wk.weight", i);
+            l->wk_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.attention.wv.weight", i);
+            l->wv_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.attention.wo.weight", i);
+            l->wo_bf16 = load_bf16_direct(sf, name);
+
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w1.weight", i);
+            l->w1_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w2.weight", i);
+            l->w2_bf16 = load_bf16_direct(sf, name);
+            snprintf(name, sizeof(name), "layers.%d.feed_forward.w3.weight", i);
+            l->w3_bf16 = load_bf16_direct(sf, name);
+
+            if (!l->wq_bf16 || !l->wk_bf16 || !l->wv_bf16 || !l->wo_bf16 ||
+                !l->w1_bf16 || !l->w2_bf16 || !l->w3_bf16) {
+                fprintf(stderr, "llm: failed to load BF16 layer %d\n", i);
+                return -1;
+            }
+        }
+
+        /* Norms (always f32) */
         snprintf(name, sizeof(name), "layers.%d.attention_norm.weight", i);
         l->attention_norm = load_f32(sf, name);
-
-        /* SwiGLU FFN */
-        snprintf(name, sizeof(name), "layers.%d.feed_forward.w1.weight", i);
-        l->w1_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "layers.%d.feed_forward.w2.weight", i);
-        l->w2_bf16 = load_bf16_direct(sf, name);
-        snprintf(name, sizeof(name), "layers.%d.feed_forward.w3.weight", i);
-        l->w3_bf16 = load_bf16_direct(sf, name);
-
         snprintf(name, sizeof(name), "layers.%d.ffn_norm.weight", i);
         l->ffn_norm = load_f32(sf, name);
 
-        if (!l->wq_bf16 || !l->wk_bf16 || !l->wv_bf16 || !l->wo_bf16 ||
-            !l->attention_norm || !l->w1_bf16 || !l->w2_bf16 || !l->w3_bf16 ||
-            !l->ffn_norm) {
-            fprintf(stderr, "llm: failed to load layer %d\n", i);
+        if (!l->attention_norm || !l->ffn_norm) {
+            fprintf(stderr, "llm: failed to load norms for layer %d\n", i);
             return -1;
         }
 
@@ -201,6 +271,8 @@ void tts_llm_forward(tts_ctx_t *ctx, const float *input_embed, float *out_hidden
     /* Start with input embedding */
     tts_copy(ctx->dec_x, input_embed, dim);
 
+    int is_int8 = dec->is_int8;
+
     /* Process each layer */
     for (int layer = 0; layer < TTS_DEC_LAYERS; layer++) {
         tts_dec_layer_t *l = &dec->layers[layer];
@@ -211,12 +283,21 @@ void tts_llm_forward(tts_ctx_t *ctx, const float *input_embed, float *out_hidden
                      1, dim, TTS_DEC_NORM_EPS);
 
         /* Q, K, V projections */
-        tts_linear_nobias_bf16(ctx->dec_q, ctx->dec_x_norm, l->wq_bf16,
-                               1, dim, q_dim);
-        tts_linear_nobias_bf16(ctx->dec_k, ctx->dec_x_norm, l->wk_bf16,
-                               1, dim, kv_dim);
-        tts_linear_nobias_bf16(ctx->dec_v, ctx->dec_x_norm, l->wv_bf16,
-                               1, dim, kv_dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->dec_q, ctx->dec_x_norm, l->wq_int8,
+                                   l->wq_scale, 1, dim, q_dim);
+            tts_linear_nobias_int8(ctx->dec_k, ctx->dec_x_norm, l->wk_int8,
+                                   l->wk_scale, 1, dim, kv_dim);
+            tts_linear_nobias_int8(ctx->dec_v, ctx->dec_x_norm, l->wv_int8,
+                                   l->wv_scale, 1, dim, kv_dim);
+        } else {
+            tts_linear_nobias_bf16(ctx->dec_q, ctx->dec_x_norm, l->wq_bf16,
+                                   1, dim, q_dim);
+            tts_linear_nobias_bf16(ctx->dec_k, ctx->dec_x_norm, l->wk_bf16,
+                                   1, dim, kv_dim);
+            tts_linear_nobias_bf16(ctx->dec_v, ctx->dec_x_norm, l->wv_bf16,
+                                   1, dim, kv_dim);
+        }
 
         /* Apply RoPE to Q and K */
         tts_apply_rope(ctx->dec_q, rope_freqs, 1, TTS_DEC_HEADS, TTS_DEC_HEAD_DIM);
@@ -238,8 +319,13 @@ void tts_llm_forward(tts_ctx_t *ctx, const float *input_embed, float *out_hidden
                              pos);
 
         /* Output projection */
-        tts_linear_nobias_bf16(ctx->dec_proj_out, ctx->dec_attn_out, l->wo_bf16,
-                               1, q_dim, dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->dec_proj_out, ctx->dec_attn_out, l->wo_int8,
+                                   l->wo_scale, 1, q_dim, dim);
+        } else {
+            tts_linear_nobias_bf16(ctx->dec_proj_out, ctx->dec_attn_out, l->wo_bf16,
+                                   1, q_dim, dim);
+        }
 
         /* Residual */
         tts_add_inplace(ctx->dec_x, ctx->dec_proj_out, dim);
@@ -250,14 +336,26 @@ void tts_llm_forward(tts_ctx_t *ctx, const float *input_embed, float *out_hidden
                      1, dim, TTS_DEC_NORM_EPS);
 
         /* SwiGLU: gate = silu(w1(x)) * w3(x), out = w2(gate) */
-        tts_linear_nobias_bf16(ctx->dec_gate, ctx->dec_x_norm, l->w1_bf16,
-                               1, dim, TTS_DEC_HIDDEN);
-        tts_linear_nobias_bf16(ctx->dec_up, ctx->dec_x_norm, l->w3_bf16,
-                               1, dim, TTS_DEC_HIDDEN);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->dec_gate, ctx->dec_x_norm, l->w1_int8,
+                                   l->w1_scale, 1, dim, TTS_DEC_HIDDEN);
+            tts_linear_nobias_int8(ctx->dec_up, ctx->dec_x_norm, l->w3_int8,
+                                   l->w3_scale, 1, dim, TTS_DEC_HIDDEN);
+        } else {
+            tts_linear_nobias_bf16(ctx->dec_gate, ctx->dec_x_norm, l->w1_bf16,
+                                   1, dim, TTS_DEC_HIDDEN);
+            tts_linear_nobias_bf16(ctx->dec_up, ctx->dec_x_norm, l->w3_bf16,
+                                   1, dim, TTS_DEC_HIDDEN);
+        }
         tts_silu(ctx->dec_gate, TTS_DEC_HIDDEN);
         tts_mul_inplace(ctx->dec_gate, ctx->dec_up, TTS_DEC_HIDDEN);
-        tts_linear_nobias_bf16(ctx->dec_ffn_out, ctx->dec_gate, l->w2_bf16,
-                               1, TTS_DEC_HIDDEN, dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ctx->dec_ffn_out, ctx->dec_gate, l->w2_int8,
+                                   l->w2_scale, 1, TTS_DEC_HIDDEN, dim);
+        } else {
+            tts_linear_nobias_bf16(ctx->dec_ffn_out, ctx->dec_gate, l->w2_bf16,
+                                   1, TTS_DEC_HIDDEN, dim);
+        }
 
         /* Residual */
         tts_add_inplace(ctx->dec_x, ctx->dec_ffn_out, dim);
@@ -315,6 +413,8 @@ void tts_llm_prefill(tts_ctx_t *ctx, const float *embeds, int seq_len) {
     /* Copy input embeddings */
     memcpy(x, embeds, (size_t)seq_len * dim * sizeof(float));
 
+    int is_int8 = dec->is_int8;
+
     /* Process each layer */
     for (int layer = 0; layer < TTS_DEC_LAYERS; layer++) {
         tts_dec_layer_t *l = &dec->layers[layer];
@@ -323,9 +423,15 @@ void tts_llm_prefill(tts_ctx_t *ctx, const float *embeds, int seq_len) {
         tts_rms_norm(x_norm, x, l->attention_norm, seq_len, dim, TTS_DEC_NORM_EPS);
 
         /* Q, K, V */
-        tts_linear_nobias_bf16(q, x_norm, l->wq_bf16, seq_len, dim, q_dim);
-        tts_linear_nobias_bf16(k, x_norm, l->wk_bf16, seq_len, dim, kv_dim);
-        tts_linear_nobias_bf16(v, x_norm, l->wv_bf16, seq_len, dim, kv_dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(q, x_norm, l->wq_int8, l->wq_scale, seq_len, dim, q_dim);
+            tts_linear_nobias_int8(k, x_norm, l->wk_int8, l->wk_scale, seq_len, dim, kv_dim);
+            tts_linear_nobias_int8(v, x_norm, l->wv_int8, l->wv_scale, seq_len, dim, kv_dim);
+        } else {
+            tts_linear_nobias_bf16(q, x_norm, l->wq_bf16, seq_len, dim, q_dim);
+            tts_linear_nobias_bf16(k, x_norm, l->wk_bf16, seq_len, dim, kv_dim);
+            tts_linear_nobias_bf16(v, x_norm, l->wv_bf16, seq_len, dim, kv_dim);
+        }
 
         /* Apply RoPE */
         tts_apply_rope(q, rope_freqs, seq_len, TTS_DEC_HEADS, TTS_DEC_HEAD_DIM);
@@ -349,20 +455,37 @@ void tts_llm_prefill(tts_ctx_t *ctx, const float *embeds, int seq_len) {
                              0, start_pos);
 
         /* Output projection + residual */
-        tts_linear_nobias_bf16(proj_out, attn_out, l->wo_bf16,
-                               seq_len, q_dim, dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(proj_out, attn_out, l->wo_int8, l->wo_scale,
+                                   seq_len, q_dim, dim);
+        } else {
+            tts_linear_nobias_bf16(proj_out, attn_out, l->wo_bf16,
+                                   seq_len, q_dim, dim);
+        }
         tts_add_inplace(x, proj_out, seq_len * dim);
 
         /* FFN */
         tts_rms_norm(x_norm, x, l->ffn_norm, seq_len, dim, TTS_DEC_NORM_EPS);
-        tts_linear_nobias_bf16(gate, x_norm, l->w1_bf16,
-                               seq_len, dim, TTS_DEC_HIDDEN);
-        tts_linear_nobias_bf16(up, x_norm, l->w3_bf16,
-                               seq_len, dim, TTS_DEC_HIDDEN);
+        if (is_int8) {
+            tts_linear_nobias_int8(gate, x_norm, l->w1_int8, l->w1_scale,
+                                   seq_len, dim, TTS_DEC_HIDDEN);
+            tts_linear_nobias_int8(up, x_norm, l->w3_int8, l->w3_scale,
+                                   seq_len, dim, TTS_DEC_HIDDEN);
+        } else {
+            tts_linear_nobias_bf16(gate, x_norm, l->w1_bf16,
+                                   seq_len, dim, TTS_DEC_HIDDEN);
+            tts_linear_nobias_bf16(up, x_norm, l->w3_bf16,
+                                   seq_len, dim, TTS_DEC_HIDDEN);
+        }
         tts_silu(gate, seq_len * TTS_DEC_HIDDEN);
         tts_mul_inplace(gate, up, seq_len * TTS_DEC_HIDDEN);
-        tts_linear_nobias_bf16(ffn_out, gate, l->w2_bf16,
-                               seq_len, TTS_DEC_HIDDEN, dim);
+        if (is_int8) {
+            tts_linear_nobias_int8(ffn_out, gate, l->w2_int8, l->w2_scale,
+                                   seq_len, TTS_DEC_HIDDEN, dim);
+        } else {
+            tts_linear_nobias_bf16(ffn_out, gate, l->w2_bf16,
+                                   seq_len, TTS_DEC_HIDDEN, dim);
+        }
         tts_add_inplace(x, ffn_out, seq_len * dim);
 
         if (tts_verbose >= 2)

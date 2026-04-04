@@ -64,6 +64,7 @@ static safetensor_dtype_t parse_dtype(const char *s) {
     if (strcmp(s, "I32") == 0) return DTYPE_I32;
     if (strcmp(s, "I64") == 0) return DTYPE_I64;
     if (strcmp(s, "BOOL") == 0) return DTYPE_BOOL;
+    if (strcmp(s, "I8") == 0) return DTYPE_I8;
     return DTYPE_UNKNOWN;
 }
 
@@ -397,6 +398,17 @@ int safetensor_is_bf16(const safetensor_t *t) {
     return t && t->dtype == DTYPE_BF16;
 }
 
+int safetensor_is_int8(const safetensor_t *t) {
+    return t && t->dtype == DTYPE_I8;
+}
+
+int8_t *safetensors_get_int8_direct(const safetensors_file_t *sf, const safetensor_t *t) {
+    if (!sf || !t) return NULL;
+    if (t->dtype != DTYPE_I8) return NULL;
+    if ((size_t)safetensor_numel(t) * 1 > t->data_size) return NULL;
+    return (int8_t *)safetensors_data(sf, t);
+}
+
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t) {
     if (!sf || !t) return NULL;
     if (t->dtype != DTYPE_BF16) return NULL;
@@ -405,8 +417,8 @@ uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safete
 }
 
 void safetensor_print(const safetensor_t *t) {
-    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL"};
-    const char *dtype_name = t->dtype >= 0 && t->dtype <= 5 ?
+    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL", "I8"};
+    const char *dtype_name = t->dtype >= 0 && t->dtype <= 6 ?
                              dtype_names[t->dtype] : "UNKNOWN";
 
     printf("%s: dtype=%s, shape=[", t->name, dtype_name);
